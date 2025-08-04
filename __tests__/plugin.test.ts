@@ -11,13 +11,31 @@ import {
 } from './helpers/config'
 import { serverless } from './helpers/serverless'
 import { options } from './helpers/options'
-import { mockLogging } from './helpers/logging'
 import { expectedPolicy } from './helpers/policy'
 import {
   expectedTarget,
   expectedTargetWithSingleScheduledAction,
 } from './helpers/target'
 import { ConcurrencyFunction } from 'src/@types'
+
+const mockLogging = {
+  log: {
+    error: jest.fn(),
+    warning: jest.fn(),
+    notice: jest.fn(),
+    info: jest.fn(),
+    debug: jest.fn(),
+    verbose: jest.fn(),
+    success: jest.fn(),
+  },
+  writeText: jest.fn(),
+  progress: {
+    create: jest.fn(),
+    get: jest.fn(),
+    update: jest.fn(),
+    remove: jest.fn(),
+  },
+}
 
 const plugin = new Plugin(serverless, {}, mockLogging)
 
