@@ -11,7 +11,7 @@ import {
   Options,
   CustomMetricConfig,
 } from './@types'
-import { schema } from './schema/schema';
+import { schema } from './schema/schema'
 import { Logging } from 'serverless/classes/Plugin'
 
 const text = {
@@ -23,7 +23,6 @@ const text = {
   NO_AUTOSCALING_CONFIG: 'Concurrency configuration is missing',
   ONLY_AWS_SUPPORT: 'Only supported for AWS provider',
 }
-
 
 export default class Plugin {
   serverless: Serverless
@@ -81,7 +80,10 @@ export default class Plugin {
       alias,
       name: config.name,
       function: config.function,
-      usage: typeof config.usage !== 'undefined' ? config.usage : 0.75,
+      usage:
+        typeof config.usage !== 'undefined' && config.usage > 0
+          ? config.usage
+          : 0.75,
       minimum: typeof config.minimum !== 'undefined' ? config.minimum : 1,
       maximum: typeof config.maximum !== 'undefined' ? config.maximum : 10,
       scaleInCooldown:
@@ -144,8 +146,9 @@ export default class Plugin {
 
   validateFunctions(instance: ConcurrencyFunction): boolean {
     return !!(
-      instance.provisionedConcurrency && 
-      (typeof instance.provisionedConcurrency ==='number' && instance.provisionedConcurrency > 0 ) &&
+      instance.provisionedConcurrency &&
+      typeof instance.provisionedConcurrency === 'number' &&
+      instance.provisionedConcurrency > 0 &&
       instance.concurrencyAutoscaling &&
       ((typeof instance.concurrencyAutoscaling === 'boolean' &&
         instance.concurrencyAutoscaling) ||
