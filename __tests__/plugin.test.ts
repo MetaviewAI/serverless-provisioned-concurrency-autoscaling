@@ -86,6 +86,24 @@ describe('Defaults', () => {
       }),
     ).toEqual(configMetric)
   })
+
+  it('should prevent usage value of 0 by using default', () => {
+    const configWithZeroUsage = {
+      ...configMin,
+      usage: 0,
+    }
+    const result = plugin.defaults(configWithZeroUsage)
+    expect(result.usage).toBe(0.75) // Should use default value instead of 0
+  })
+
+  it('should allow small positive usage values', () => {
+    const configWithSmallUsage = {
+      ...configMin,
+      usage: 0.1,
+    }
+    const result = plugin.defaults(configWithSmallUsage)
+    expect(result.usage).toBe(0.1) // Should keep the small positive value
+  })
 })
 
 describe('Resources', () => {
