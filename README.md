@@ -101,6 +101,62 @@ That's it! With the next deployment, [serverless](https://serverless.com) will a
 
 You must provide at least `provisionedConcurrency` and `concurrencyAutoscaling` to enable autoscaling. Set `concurrencyAutoscaling` to a boolean, or object with configuration. Any omitted configuration will use module defaults.
 
+### Generated Configuration
+
+Instead of setting `provisionedConcurrency` and `concurrencyAutoscaling` per function, a function
+can declare its concurrency for each deploy, and the plugin applies the right block for the deploy
+being packaged. It does so on `initialize`, before the framework compiles functions.
+
+```yaml
+custom:
+  provisionedConcurrencyAutoscaling:
+    target: us-prod                   # the deploy being packaged
+    deploys:                          # every valid deploy name
+      uk-prod: {}
+      uk-alpha: {}
+      us-prod:                        # borrows uk-prod's block...
+        from: uk-prod
+        maxFloor: 1                   # ...keeping at most 1 warm instance
+      us-alpha:
+        from: uk-alpha
+
+functions:
+  graphql:
+    handler: graphql.handler
+    concurrency:
+      targetUtilization: 0.8          # settings outside a block apply to every block
+      statistic: maximum              # optional, default average
+      uk-prod:
+        min: 3                        # warm instances
+        max: 500                      # autoscaling ceiling
+      uk-alpha:                       # omit a deploy's block for no warm pool there
+        min: 1
+        max: 2
+      us-prod:                        # optional: laid over the borrowed uk-prod block
+        min: 10
+  server:                             # a Lambda Managed Instances function
+    handler: server.handler
+    concurrency:
+      uk-prod:
+        min: 3                        # FunctionScalingConfig.MinExecutionEnvironments
+        maxVCpuCount: 400             # MaxVCpuCount of the capacity provider it references
+```
+
+For the target, the plugin starts from the block its deploy entry borrows `from` (with the
+provisioned-concurrency floor capped at `maxFloor`), then lays the target's own block over it.
+A missing block, `min` or `max` means 0, and a floor of 0 means no warm pool: the function gets no
+`provisionedConcurrency` and no `concurrencyAutoscaling`.
+
+A floor above 0 sets the function's `provisionedConcurrency` and `concurrencyAutoscaling`
+(`minimum`, `maximum`, `usage`, `scaleInCooldown`, `customMetric.statistic`). An entry with
+`maxVCpuCount` sets the Managed Instances function's `FunctionScalingConfig` in
+`resources.extensions` and the `MaxVCpuCount` of the capacity provider its
+`CapacityProviderConfig` references; `maxFloor` does not apply to it.
+
+Packaging fails on a block or target not listed in `deploys`, an unknown setting, a block with a
+ceiling but no floor, `min > max`, or a function that also sets `provisionedConcurrency` or
+`concurrencyAutoscaling` itself.
+
 ### Defaults
 
 ```yaml

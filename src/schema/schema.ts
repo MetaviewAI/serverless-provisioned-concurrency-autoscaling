@@ -1,6 +1,10 @@
 export const schema = {
   type: 'object',
   properties: {
+    // Per-deployment-target concurrency, resolved by the plugin (src/generated.ts).
+    concurrency: {
+      type: 'object',
+    },
     concurrencyAutoscaling: {
       anyOf: [
         {

@@ -12,6 +12,7 @@ import {
   CustomMetricConfig,
 } from './@types'
 import { schema } from './schema/schema'
+import { applyGeneratedConfig } from './generated'
 import { Logging } from 'serverless/classes/Plugin'
 
 const text = {
@@ -46,8 +47,18 @@ export default class Plugin {
     }
 
     this.hooks = {
+      // The framework compiles provisionedConcurrency into the alias in package:compileFunctions,
+      // so generated configuration must land on the functions before any lifecycle runs.
+      initialize: this.applyGeneratedConfig.bind(this),
       'package:compileEvents': this.beforeDeployResources.bind(this),
     }
+  }
+
+  applyGeneratedConfig(): void {
+    const naming = this.serverless.getProvider('aws').naming
+    applyGeneratedConfig(this.serverless.service, (name) =>
+      naming.getLambdaLogicalId(name),
+    )
   }
 
   validate(pcFunctions: AutoscalingConfig[]): void {
