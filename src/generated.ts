@@ -1,50 +1,44 @@
 import { AwsFunctionConfig } from './@types'
 
-// Generated configuration: a function declares its concurrency for every deployment target, and
-// the plugin resolves it for the target being packaged.
+// Generated configuration: a function declares its concurrency per deploy, in blocks named after
+// the deploys, and the plugin applies the block for the deploy being packaged.
 //
 //   custom:
 //     provisionedConcurrencyAutoscaling:
-//       target:                    # the deployment target being packaged
-//         deploymentTarget: us-prod
-//         stage: prod
-//         deploymentGroup: us
-//       primaryDeploymentGroup: uk # optional, default uk
+//       target: us-prod                          # the deploy being packaged
+//       deploys:                                 # every valid deploy name
+//         uk-prod: {}
+//         us-prod: { from: uk-prod, maxFloor: 1 } # borrows uk-prod, at most 1 warm instance
 //
 //   functions:
 //     graphql:
 //       handler: graphql.handler
 //       concurrency:
-//         targetUtilization: 0.8   # shared by every target, as are scaleInCooldown and statistic
-//         prod: { min: 3, max: 500 }
-//         alpha: { min: 1, max: 2 }
-//         us-prod: { min: 10 }     # optional override for one deployment target, applied last
+//         targetUtilization: 0.8                 # settings outside a block apply to every block
+//         uk-prod: { min: 3, max: 500 }
+//         us-prod: { min: 10 }                   # optional: laid over the borrowed block
 //
-// Resolution:
-//   - every target of a stage shares that stage's block;
-//   - the prod target in the primary deployment group keeps `prod.min`; every other prod target
-//     gets max(alpha.min, 1) capped at `prod.min`;
-//   - a block keyed by the target's deploymentTarget overrides the result for that target.
-//
-// A missing stage block, `min` or `max` means 0, and a floor of 0 means no warm pool on that
-// target; a stage block with a ceiling but no floor is rejected, since it could never take effect. A resolved entry with a floor above 0 becomes the function's provisionedConcurrency
-// (min) and concurrencyAutoscaling. An entry with
-// `maxVCpuCount` instead sizes a Lambda Managed Instances function: `min` becomes its
-// FunctionScalingConfig.MinExecutionEnvironments and `maxVCpuCount` the MaxVCpuCount of the
-// capacity provider its CapacityProviderConfig references (both in `resources`).
+// For the target, the plugin starts from the `from` block of the target's deploy entry, if any
+// (its provisioned-concurrency floor capped at `maxFloor`), then lays the target's own block over
+// it. Block names outside `deploys` fail the package, so a typo cannot silently drop a warm pool.
+// A missing block, `min` or `max` means 0, and a floor of 0 means no warm pool: the function gets
+// no provisionedConcurrency or concurrencyAutoscaling. A floor above 0 becomes the function's
+// provisionedConcurrency and concurrencyAutoscaling. An entry with `maxVCpuCount` instead sizes a
+// Lambda Managed Instances function: `min` becomes its FunctionScalingConfig.MinExecutionEnvironments
+// and `maxVCpuCount` the MaxVCpuCount of the capacity provider its CapacityProviderConfig
+// references (both in `resources`); `maxFloor` does not apply to it.
 
-export interface DeploymentTarget {
-  deploymentTarget: string
-  stage: string
-  deploymentGroup: string
+export interface Deploy {
+  from?: string
+  maxFloor?: number
 }
 
 export interface GeneratedConfig {
-  target: DeploymentTarget
-  primaryDeploymentGroup?: string
+  target: string
+  deploys: Record<string, Deploy | null>
 }
 
-export type SpecEntry = Record<string, unknown>
+export type ConcurrencyBlocks = Record<string, unknown>
 
 export interface ResolvedEntry {
   min: number
@@ -56,7 +50,6 @@ export interface ResolvedEntry {
   [key: string]: unknown
 }
 
-const STAGE_KEYS = ['prod', 'alpha']
 const SETTING_KEYS = [
   'min',
   'max',
@@ -65,21 +58,22 @@ const SETTING_KEYS = [
   'scaleInCooldown',
   'statistic',
 ]
-const DEFAULT_PRIMARY_DEPLOYMENT_GROUP = 'uk'
 
 const isBlock = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
-export function resolveEntry(
+function validateBlocks(
   name: string,
-  entry: SpecEntry,
-  target: DeploymentTarget,
-  primaryDeploymentGroup = DEFAULT_PRIMARY_DEPLOYMENT_GROUP,
-): ResolvedEntry {
-  const shared = Object.fromEntries(
-    Object.entries(entry).filter(([, value]) => !isBlock(value)),
-  )
-  for (const [key, value] of Object.entries(entry)) {
+  concurrency: ConcurrencyBlocks,
+  deploys: string[],
+): void {
+  for (const [key, value] of Object.entries(concurrency)) {
+    if (isBlock(value) && !deploys.includes(key)) {
+      throw new Error(
+        `concurrency of function "${name}" has a block for unknown deploy "${key}"; ` +
+          `expected one of ${deploys.join(', ')}`,
+      )
+    }
     const settings = isBlock(value) ? Object.keys(value) : [key]
     const unknown = settings.filter(
       (setting) => !SETTING_KEYS.includes(setting),
@@ -90,38 +84,85 @@ export function resolveEntry(
           `expected ${SETTING_KEYS.join(', ')}`,
       )
     }
-  }
-  for (const stage of STAGE_KEYS) {
-    const written = entry[stage]
     if (
-      isBlock(written) &&
-      Number(written.max ?? 0) > 0 &&
-      !Number(written.min ?? 0)
+      isBlock(value) &&
+      Number(value.max ?? 0) > 0 &&
+      !Number(value.min ?? 0)
     ) {
       throw new Error(
-        `concurrency of function "${name}" sets ${stage}.max without a floor; ` +
+        `concurrency of function "${name}" sets ${key}.max without a floor; ` +
           'provisioned concurrency cannot scale up from 0, so set min or omit max',
       )
     }
   }
-  const block = entry[target.stage]
-  const stageBlock: Record<string, unknown> = isBlock(block) ? block : {}
-  const resolved: Record<string, unknown> = { min: 0, ...shared, ...stageBlock }
+}
 
+export interface Selection {
+  target: string
+  deploy: Deploy
+  deploys: string[]
+}
+
+export function selectDeploy(config: GeneratedConfig | undefined): Selection {
   if (
-    target.stage === 'prod' &&
-    target.deploymentGroup !== primaryDeploymentGroup
+    !isBlock(config) ||
+    typeof config.target !== 'string' ||
+    !isBlock(config.deploys)
   ) {
-    const alpha = entry.alpha
-    const alphaMin =
-      isBlock(alpha) && typeof alpha.min === 'number' ? alpha.min : 0
-    resolved.min = Math.min(resolved.min as number, Math.max(alphaMin, 1))
+    throw new Error(
+      'functions declare concurrency, but custom.provisionedConcurrencyAutoscaling needs a target and deploys',
+    )
+  }
+  const deploys = Object.keys(config.deploys)
+  if (!deploys.includes(config.target)) {
+    throw new Error(
+      `deploy "${config.target}" is not in provisionedConcurrencyAutoscaling.deploys (${deploys.join(', ')})`,
+    )
+  }
+  const entry: unknown = config.deploys[config.target] ?? {}
+  if (!isBlock(entry)) {
+    throw new Error(`deploy "${config.target}" must be a mapping`)
+  }
+  const deploy = entry as Deploy
+  const { from, maxFloor } = deploy
+  if (from !== undefined && !deploys.includes(from)) {
+    throw new Error(
+      `deploy "${config.target}" borrows from unknown deploy "${from}"`,
+    )
+  }
+  if (
+    maxFloor !== undefined &&
+    !(Number.isInteger(maxFloor) && maxFloor >= 0)
+  ) {
+    throw new Error(
+      `deploy "${config.target}" has maxFloor ${maxFloor}; expected an integer >= 0`,
+    )
+  }
+  return { target: config.target, deploy, deploys }
+}
+
+export function resolveEntry(
+  name: string,
+  concurrency: ConcurrencyBlocks,
+  { target, deploy, deploys }: Selection,
+): ResolvedEntry {
+  validateBlocks(name, concurrency, deploys)
+  const shared = Object.fromEntries(
+    Object.entries(concurrency).filter(([, value]) => !isBlock(value)),
+  )
+  const block = (key: string) => {
+    const value = concurrency[key]
+    return isBlock(value) ? value : {}
   }
 
-  const override = entry[target.deploymentTarget]
-  if (isBlock(override)) {
-    Object.assign(resolved, override)
+  const resolved: Record<string, unknown> = { min: 0, ...shared }
+  if (deploy.from !== undefined) {
+    Object.assign(resolved, block(deploy.from))
+    if (deploy.maxFloor !== undefined && resolved.maxVCpuCount === undefined) {
+      resolved.min = Math.min(resolved.min as number, deploy.maxFloor)
+    }
   }
+  Object.assign(resolved, block(target))
   if (resolved.max === undefined && resolved.maxVCpuCount === undefined) {
     resolved.max = 0
   }
@@ -135,25 +176,10 @@ export function resolveEntry(
   if (!validMin || !validMax) {
     throw new Error(
       `concurrency of function "${name}" resolves to min ${min} / max ${max ?? maxVCpuCount} ` +
-        `for ${target.deploymentTarget}; expected integers with 0 <= min <= max`,
+        `for ${target}; expected integers with 0 <= min <= max`,
     )
   }
   return resolved as ResolvedEntry
-}
-
-export function validateTarget(target: DeploymentTarget): void {
-  for (const key of ['deploymentTarget', 'stage', 'deploymentGroup']) {
-    if (typeof target?.[key] !== 'string') {
-      throw new Error(
-        `provisionedConcurrencyAutoscaling.target needs a "${key}"`,
-      )
-    }
-  }
-  if (!STAGE_KEYS.includes(target.stage)) {
-    throw new Error(
-      `unsupported stage "${target.stage}"; expected one of ${STAGE_KEYS.join(', ')}`,
-    )
-  }
 }
 
 export function scalingFor(entry: ResolvedEntry): AwsFunctionConfig {
@@ -243,22 +269,17 @@ export function applyGeneratedConfig(
   )
   if (declared.length === 0) return
 
-  const config: GeneratedConfig | undefined =
-    service.custom?.provisionedConcurrencyAutoscaling
-  if (!config) {
-    throw new Error(
-      'functions declare concurrency but custom.provisionedConcurrencyAutoscaling.target is not set',
-    )
-  }
-  validateTarget(config.target)
+  const selection = selectDeploy(
+    service.custom?.provisionedConcurrencyAutoscaling,
+  )
   for (const [name, fn] of declared) {
+    const definition = fn as Record<string, unknown>
     const entry = resolveEntry(
       name,
-      (fn as Record<string, unknown>).concurrency as SpecEntry,
-      config.target,
-      config.primaryDeploymentGroup,
+      definition.concurrency as ConcurrencyBlocks,
+      selection,
     )
-    delete (fn as Record<string, unknown>).concurrency
+    delete definition.concurrency
     applyEntry(service, name, entry, lambdaLogicalId)
   }
 }

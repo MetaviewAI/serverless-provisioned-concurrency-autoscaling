@@ -1,64 +1,46 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import Plugin from '../src/plugin'
-import {
-  applyGeneratedConfig,
-  DeploymentTarget,
-  resolveEntry,
-} from '../src/generated'
+import { applyGeneratedConfig, Deploy, resolveEntry } from '../src/generated'
 
-const targets: Record<string, DeploymentTarget> = {
-  'uk-prod': {
-    deploymentTarget: 'uk-prod',
-    stage: 'prod',
-    deploymentGroup: 'uk',
-  },
-  'us-prod': {
-    deploymentTarget: 'us-prod',
-    stage: 'prod',
-    deploymentGroup: 'us',
-  },
-  'uk-alpha': {
-    deploymentTarget: 'uk-alpha',
-    stage: 'alpha',
-    deploymentGroup: 'uk',
-  },
-  'us-alpha': {
-    deploymentTarget: 'us-alpha',
-    stage: 'alpha',
-    deploymentGroup: 'us',
-  },
+const deploys: Record<string, Deploy> = {
+  'uk-prod': {},
+  'uk-alpha': {},
+  'us-prod': { from: 'uk-prod', maxFloor: 1 },
+  'us-alpha': { from: 'uk-alpha' },
 }
 
 const graphql = {
   targetUtilization: 0.6,
   scaleInCooldown: 2700,
-  prod: { min: 120, max: 600 },
-  alpha: { min: 2, max: 25 },
+  'uk-prod': { min: 120, max: 600 },
+  'uk-alpha': { min: 2, max: 25 },
 }
 const authorizer = {
   statistic: 'maximum',
   targetUtilization: 0.8,
-  prod: { min: 3, max: 150 },
-  alpha: { min: 20, max: 25 },
+  'uk-prod': { min: 3, max: 150 },
 }
-const evaluate = {
-  targetUtilization: 0.8,
-  prod: { min: 20, max: 600 },
-}
+
+const resolve = (concurrency: any, target: string) =>
+  resolveEntry('fn', concurrency, {
+    target,
+    deploy: deploys[target] ?? {},
+    deploys: Object.keys(deploys),
+  })
 
 const logicalId = (name: string) =>
   `${name[0].toUpperCase()}${name.slice(1)}LambdaFunction`
 
 const serviceWith = (target: string, functions: any, resources?: any): any => ({
-  custom: { provisionedConcurrencyAutoscaling: { target: targets[target] } },
+  custom: { provisionedConcurrencyAutoscaling: { target, deploys } },
   functions,
   resources,
 })
 
 describe('resolveEntry', () => {
-  it('keeps the prod block on the primary prod target', () => {
+  it('reads the block named after the target, with the shared settings', () => {
     // Given / When
-    const resolved = resolveEntry('graphql', graphql, targets['uk-prod'])
+    const resolved = resolve(graphql, 'uk-prod')
 
     // Then
     expect(resolved).toEqual({
@@ -69,59 +51,31 @@ describe('resolveEntry', () => {
     })
   })
 
-  it('gives other prod targets the shared ceiling and the higher of the alpha floor and 1', () => {
+  it('borrows the fallback block with its floor capped at maxFloor', () => {
     // Given / When
-    const withAlphaFloor = resolveEntry('graphql', graphql, targets['us-prod'])
-    const withoutAlphaFloor = resolveEntry(
-      'evaluate',
-      evaluate,
-      targets['us-prod'],
-    )
+    const resolved = resolve(graphql, 'us-prod')
 
     // Then
-    expect([withAlphaFloor.min, withAlphaFloor.max]).toEqual([2, 600])
-    expect([withoutAlphaFloor.min, withoutAlphaFloor.max]).toEqual([1, 600])
+    expect([resolved.min, resolved.max, resolved.targetUtilization]).toEqual([
+      1, 600, 0.6,
+    ])
   })
 
-  it('never gives another prod target a warmer floor than the primary', () => {
+  it('never raises a floor to maxFloor', () => {
+    // Given / When / Then
+    expect(resolve({ 'uk-prod': { min: 0 } }, 'us-prod').min).toBe(0)
+  })
+
+  it("lays the target's own block over the borrowed one", () => {
     // Given
-    const dormant = { prod: {}, alpha: { min: 5, max: 5 } }
-
-    // When / Then
-    expect(resolveEntry('authorizer', authorizer, targets['us-prod']).min).toBe(
-      3,
-    )
-    expect(resolveEntry('dormant', dormant, targets['us-prod']).min).toBe(0)
-  })
-
-  it('follows a configured primary deployment group', () => {
-    // Given / When
-    const resolved = resolveEntry('graphql', graphql, targets['us-prod'], 'us')
-
-    // Then
-    expect(resolved.min).toBe(120)
-  })
-
-  it('shares the alpha block across alpha targets', () => {
-    // Given / When
-    const uk = resolveEntry('graphql', graphql, targets['uk-alpha'])
-    const us = resolveEntry('graphql', graphql, targets['us-alpha'])
-
-    // Then
-    expect(uk).toEqual(us)
-    expect([uk.min, uk.max, uk.targetUtilization]).toEqual([2, 25, 0.6])
-  })
-
-  it('applies a deployment-target override to that target only', () => {
-    // Given
-    const withOverride = {
+    const withOwn = {
       ...graphql,
       'us-prod': { min: 50, targetUtilization: 0.7 },
     }
 
     // When
-    const us = resolveEntry('graphql', withOverride, targets['us-prod'])
-    const uk = resolveEntry('graphql', withOverride, targets['uk-prod'])
+    const us = resolve(withOwn, 'us-prod')
+    const uk = resolve(withOwn, 'uk-prod')
 
     // Then
     expect([us.min, us.max, us.targetUtilization]).toEqual([50, 600, 0.7])
@@ -129,52 +83,60 @@ describe('resolveEntry', () => {
     expect(uk['us-prod']).toBeUndefined()
   })
 
-  it('treats a missing stage block, floor or ceiling as 0', () => {
+  it('borrows a block unchanged when the fallback has no maxFloor', () => {
+    // Given / When
+    const uk = resolve(graphql, 'uk-alpha')
+    const us = resolve(graphql, 'us-alpha')
+
+    // Then
+    expect(us).toEqual(uk)
+    expect([us.min, us.max]).toEqual([2, 25])
+  })
+
+  it('treats a missing block, floor or ceiling as 0', () => {
     // Given
-    const prodOnly = { prod: { min: 1, max: 2 } }
     const settingsOnly = {
-      prod: { min: 1, max: 2 },
-      alpha: { targetUtilization: 0.5 },
+      'uk-prod': { min: 1, max: 2 },
+      'uk-alpha': { targetUtilization: 0.5 },
     }
-    const regionOff = { ...graphql, 'us-prod': { min: 0 } }
 
     // When / Then
-    expect(resolveEntry('fn', prodOnly, targets['us-alpha'])).toEqual({
+    expect(resolve(authorizer, 'uk-alpha')).toEqual({
+      statistic: 'maximum',
+      targetUtilization: 0.8,
       min: 0,
       max: 0,
     })
-    expect(resolveEntry('fn', settingsOnly, targets['uk-alpha'])).toEqual({
+    expect(resolve(settingsOnly, 'uk-alpha')).toEqual({
       min: 0,
       max: 0,
       targetUtilization: 0.5,
     })
-    expect(resolveEntry('fn', prodOnly, targets['us-prod']).min).toBe(1)
-    expect(resolveEntry('graphql', regionOff, targets['us-prod']).min).toBe(0)
   })
 
   it('rejects entries that cannot resolve or could never take effect', () => {
     // Given
     const floorAboveCeiling = { ...graphql, 'us-prod': { min: 700 } }
     const ceilingWithoutFloor = {
-      prod: { min: 1, max: 2 },
-      alpha: { min: 0, max: 10 },
+      'uk-prod': { min: 1, max: 2 },
+      'uk-alpha': { min: 0, max: 10 },
     }
-    const fractional = { prod: { min: 1.5, max: 2 } }
-    const unknownSetting = { prod: { min: 1, max: 2, reserved: 500 } }
+    const fractional = { 'uk-prod': { min: 1.5, max: 2 } }
+    const unknownSetting = { 'uk-prod': { min: 1, max: 2, reserved: 500 } }
+    const typo = { 'uk-prd': { min: 3, max: 500 } }
 
     // When / Then
-    expect(() =>
-      resolveEntry('graphql', floorAboveCeiling, targets['us-prod']),
-    ).toThrow('min 700 / max 600 for us-prod')
-    expect(() =>
-      resolveEntry('fn', ceilingWithoutFloor, targets['uk-prod']),
-    ).toThrow('alpha.max without a floor')
-    expect(() => resolveEntry('fn', fractional, targets['uk-prod'])).toThrow(
-      'expected integers',
+    expect(() => resolve(floorAboveCeiling, 'us-prod')).toThrow(
+      'min 700 / max 600 for us-prod',
     )
-    expect(() =>
-      resolveEntry('fn', unknownSetting, targets['uk-prod']),
-    ).toThrow('unknown setting reserved')
+    expect(() => resolve(ceilingWithoutFloor, 'uk-prod')).toThrow(
+      'uk-alpha.max without a floor',
+    )
+    expect(() => resolve(fractional, 'uk-prod')).toThrow('expected integers')
+    expect(() => resolve(typo, 'uk-prod')).toThrow('unknown deploy "uk-prd"')
+    expect(() => resolve(unknownSetting, 'uk-prod')).toThrow(
+      'unknown setting reserved',
+    )
   })
 })
 
@@ -193,10 +155,10 @@ describe('applyGeneratedConfig', () => {
     // Then
     expect(service.functions.graphql).toEqual({
       handler: 'g',
-      provisionedConcurrency: 2,
+      provisionedConcurrency: 1,
       concurrencyAutoscaling: {
         enabled: true,
-        minimum: 2,
+        minimum: 1,
         maximum: 600,
         usage: 0.6,
         scaleInCooldown: 2700,
@@ -205,7 +167,7 @@ describe('applyGeneratedConfig', () => {
     })
     expect(service.functions.authorizer.concurrencyAutoscaling).toEqual({
       enabled: true,
-      minimum: 3,
+      minimum: 1,
       maximum: 150,
       usage: 0.8,
       customMetric: { statistic: 'maximum' },
@@ -213,14 +175,14 @@ describe('applyGeneratedConfig', () => {
     expect(service.functions.plain).toEqual({ handler: 'p' })
   })
 
-  it('gives a function no warm pool on a target where its floor is 0', () => {
+  it('gives a function no warm pool when its floor is 0', () => {
     // Given
     const service = serviceWith('uk-alpha', {
-      evaluate: { handler: 'e', concurrency: evaluate },
+      authorizer: { handler: 'a', concurrency: authorizer },
       stream: {
         handler: 's',
         reservedConcurrency: 10,
-        concurrency: { prod: { min: 120, max: 200 } },
+        concurrency: { 'uk-prod': { min: 120, max: 200 } },
       },
     })
 
@@ -228,7 +190,7 @@ describe('applyGeneratedConfig', () => {
     applyGeneratedConfig(service, logicalId)
 
     // Then
-    expect(service.functions.evaluate).toEqual({ handler: 'e' })
+    expect(service.functions.authorizer).toEqual({ handler: 'a' })
     expect(service.functions.stream).toEqual({
       handler: 's',
       reservedConcurrency: 10,
@@ -238,13 +200,13 @@ describe('applyGeneratedConfig', () => {
   it('sizes a Managed Instances function and its capacity provider', () => {
     // Given
     const service = serviceWith(
-      'us-prod',
+      'uk-prod',
       {
         server: {
           handler: 's',
           concurrency: {
-            prod: { min: 3, maxVCpuCount: 400 },
-            alpha: { min: 3, maxVCpuCount: 40 },
+            'uk-prod': { min: 3, maxVCpuCount: 400 },
+            'uk-alpha': { min: 3, maxVCpuCount: 40 },
           },
         },
       },
@@ -294,40 +256,53 @@ describe('applyGeneratedConfig', () => {
     })
   })
 
+  it('does not cap a Managed Instances floor with maxFloor', () => {
+    // Given / When
+    const resolved = resolve(
+      { 'uk-prod': { min: 3, maxVCpuCount: 400 } },
+      'us-prod',
+    )
+
+    // Then
+    expect(resolved).toEqual({ min: 3, maxVCpuCount: 400 })
+  })
+
   it('rejects configuration it cannot apply unambiguously', () => {
     // Given
     const noTarget: any = {
       custom: {},
-      functions: { evaluate: { concurrency: evaluate } },
+      functions: { authorizer: { concurrency: authorizer } },
     }
-    const badTarget: any = {
+    const unknownTarget = serviceWith('eu-prod', {
+      authorizer: { concurrency: authorizer },
+    })
+    const unknownSource: any = {
       custom: {
-        provisionedConcurrencyAutoscaling: { target: { stage: 'prod' } },
+        provisionedConcurrencyAutoscaling: {
+          target: 'us-prod',
+          deploys: { 'uk-prod': {}, 'us-prod': { from: 'uk-prd' } },
+        },
       },
-      functions: { evaluate: { concurrency: evaluate } },
+      functions: { authorizer: { concurrency: authorizer } },
     }
     const alsoConfigured = serviceWith('uk-prod', {
-      evaluate: { provisionedConcurrency: 5, concurrency: evaluate },
+      authorizer: { provisionedConcurrency: 5, concurrency: authorizer },
     })
     const notManaged = serviceWith(
       'uk-prod',
-      {
-        server: {
-          concurrency: {
-            prod: { min: 3, maxVCpuCount: 40 },
-            alpha: { min: 3, maxVCpuCount: 40 },
-          },
-        },
-      },
+      { server: { concurrency: { 'uk-prod': { min: 3, maxVCpuCount: 40 } } } },
       { Resources: {}, extensions: {} },
     )
 
     // When / Then
     expect(() => applyGeneratedConfig(noTarget, logicalId)).toThrow(
-      'target is not set',
+      'needs a target and deploys',
     )
-    expect(() => applyGeneratedConfig(badTarget, logicalId)).toThrow(
-      'needs a "deploymentTarget"',
+    expect(() => applyGeneratedConfig(unknownTarget, logicalId)).toThrow(
+      'deploy "eu-prod" is not in provisionedConcurrencyAutoscaling.deploys',
+    )
+    expect(() => applyGeneratedConfig(unknownSource, logicalId)).toThrow(
+      'borrows from unknown deploy "uk-prd"',
     )
     expect(() => applyGeneratedConfig(alsoConfigured, logicalId)).toThrow(
       'sets both provisionedConcurrency and concurrency',
@@ -349,7 +324,7 @@ describe('Plugin generated configuration', () => {
   it('applies function concurrency on initialize, before the framework compiles functions', () => {
     // Given
     const serverless = serverlessWith(
-      serviceWith('uk-prod', { evaluate: { concurrency: evaluate } }),
+      serviceWith('uk-prod', { graphql: { concurrency: graphql } }),
     )
     const plugin = new Plugin(serverless, {}, logging)
 
@@ -357,11 +332,11 @@ describe('Plugin generated configuration', () => {
     ;(plugin.hooks.initialize as () => void)()
 
     // Then
-    expect(serverless.service.functions.evaluate.provisionedConcurrency).toBe(
-      20,
+    expect(serverless.service.functions.graphql.provisionedConcurrency).toBe(
+      120,
     )
     expect(
-      serverless.service.functions.evaluate.concurrencyAutoscaling.maximum,
+      serverless.service.functions.graphql.concurrencyAutoscaling.maximum,
     ).toBe(600)
   })
 
@@ -369,7 +344,7 @@ describe('Plugin generated configuration', () => {
     // Given
     const serverless = serverlessWith({
       custom: {},
-      functions: { evaluate: { provisionedConcurrency: 1 } },
+      functions: { graphql: { provisionedConcurrency: 1 } },
     })
     const plugin = new Plugin(serverless, {}, logging)
 
@@ -377,7 +352,7 @@ describe('Plugin generated configuration', () => {
     ;(plugin.hooks.initialize as () => void)()
 
     // Then
-    expect(serverless.service.functions.evaluate).toEqual({
+    expect(serverless.service.functions.graphql).toEqual({
       provisionedConcurrency: 1,
     })
   })
