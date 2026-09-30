@@ -103,43 +103,43 @@ You must provide at least `provisionedConcurrency` and `concurrencyAutoscaling` 
 
 ### Generated Configuration
 
-Instead of configuring each function, a service can declare one spec for every deployment target
-and let the plugin resolve it for the target being packaged. The plugin applies it on `initialize`,
-before the framework compiles functions, so functions carry no concurrency configuration.
+Instead of setting `provisionedConcurrency` and `concurrencyAutoscaling` per function and per
+stage, a function can declare its `concurrency` for every deployment target, and the plugin
+resolves it for the target being packaged. The plugin applies it on `initialize`, before the
+framework compiles functions.
 
 ```yaml
 custom:
   provisionedConcurrencyAutoscaling:
-    spec: ${file(./provisionedConcurrency.yml)}
     target:                     # the deployment target being packaged
       deploymentTarget: us-prod
       stage: prod               # prod or alpha
       deploymentGroup: us
     primaryDeploymentGroup: uk  # optional, default uk
-```
 
-`provisionedConcurrency.yml`, one entry per function key:
-
-```yaml
-graphql:
-  statistic: maximum        # shared by every target, like targetUtilization and scaleInCooldown
-  targetUtilization: 0.8
-  prod:
-    min: 3
-    max: 500
-    reserved: 800           # optional reservedConcurrency
-  alpha:
-    min: 1
-    max: 2
-  us-prod:                  # optional override for one deployment target, applied last
-    min: 10
-server:                     # a Lambda Managed Instances function
-  prod:
-    min: 3                  # FunctionScalingConfig.MinExecutionEnvironments
-    maxVCpuCount: 400       # MaxVCpuCount of the capacity provider it references
-  alpha:
-    min: 3
-    maxVCpuCount: 40
+functions:
+  graphql:
+    handler: graphql.handler
+    concurrency:
+      targetUtilization: 0.8    # shared by every target, like scaleInCooldown and statistic
+      statistic: maximum        # optional, default average
+      prod:
+        min: 3                  # warm instances
+        max: 500                # autoscaling ceiling
+      alpha:                    # omit a stage for no warm pool there
+        min: 1
+        max: 2
+      us-prod:                  # optional override for one deployment target, applied last
+        min: 10
+  server:                       # a Lambda Managed Instances function
+    handler: server.handler
+    concurrency:
+      prod:
+        min: 3                  # FunctionScalingConfig.MinExecutionEnvironments
+        maxVCpuCount: 400       # MaxVCpuCount of the capacity provider it references
+      alpha:
+        min: 3
+        maxVCpuCount: 40
 ```
 
 Resolution:
@@ -147,14 +147,17 @@ Resolution:
 - every target of a stage shares that stage's block;
 - the prod target in the primary deployment group keeps `prod.min`; every other prod target gets
   `max(alpha.min, 1)`, capped at `prod.min`;
-- a block keyed by the target's `deploymentTarget` overrides the result for that target.
+- a block keyed by the target's `deploymentTarget` overrides the result for that target;
+- a missing stage block, `min` or `max` means 0, and a floor of 0 means no warm pool on that
+  target: the function gets no `provisionedConcurrency` and no `concurrencyAutoscaling`.
 
-An entry with `max` sets the function's `provisionedConcurrency` (the floor) and
-`concurrencyAutoscaling` (`minimum`, `maximum`, `usage`, `scaleInCooldown`, and
-`customMetric.statistic`, default `average`). An entry with `maxVCpuCount` sets the Managed
-Instances function's `FunctionScalingConfig` in `resources.extensions` and the `MaxVCpuCount` of the
-capacity provider its `CapacityProviderConfig` references. Packaging fails if an entry matches no
-function, if the function also sets the properties the entry owns, or if a spec cannot resolve.
+A floor above 0 sets the function's `provisionedConcurrency` and `concurrencyAutoscaling`
+(`minimum`, `maximum`, `usage`, `scaleInCooldown`, `customMetric.statistic`). An entry with
+`maxVCpuCount` sets the Managed Instances function's `FunctionScalingConfig` in
+`resources.extensions` and the `MaxVCpuCount` of the capacity provider its
+`CapacityProviderConfig` references. Packaging fails on an unknown setting, a stage block with a
+ceiling but no floor, `min > max`, a function that also sets `provisionedConcurrency` or
+`concurrencyAutoscaling` itself, or `concurrency` without `custom.provisionedConcurrencyAutoscaling.target`.
 
 ### Defaults
 

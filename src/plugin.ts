@@ -12,7 +12,7 @@ import {
   CustomMetricConfig,
 } from './@types'
 import { schema } from './schema/schema'
-import { applySpec, GeneratedConfig, resolveSpec } from './generated'
+import { applyGeneratedConfig } from './generated'
 import { Logging } from 'serverless/classes/Plugin'
 
 const text = {
@@ -55,12 +55,8 @@ export default class Plugin {
   }
 
   applyGeneratedConfig(): void {
-    const config: GeneratedConfig | undefined =
-      this.serverless.service.custom?.provisionedConcurrencyAutoscaling
-    if (!config) return
-
     const naming = this.serverless.getProvider('aws').naming
-    applySpec(this.serverless.service, resolveSpec(config), (name) =>
+    applyGeneratedConfig(this.serverless.service, (name) =>
       naming.getLambdaLogicalId(name),
     )
   }
