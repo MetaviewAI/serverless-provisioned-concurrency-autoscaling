@@ -101,6 +101,61 @@ That's it! With the next deployment, [serverless](https://serverless.com) will a
 
 You must provide at least `provisionedConcurrency` and `concurrencyAutoscaling` to enable autoscaling. Set `concurrencyAutoscaling` to a boolean, or object with configuration. Any omitted configuration will use module defaults.
 
+### Generated Configuration
+
+Instead of configuring each function, a service can declare one spec for every deployment target
+and let the plugin resolve it for the target being packaged. The plugin applies it on `initialize`,
+before the framework compiles functions, so functions carry no concurrency configuration.
+
+```yaml
+custom:
+  provisionedConcurrencyAutoscaling:
+    spec: ${file(./provisionedConcurrency.yml)}
+    target:                     # the deployment target being packaged
+      deploymentTarget: us-prod
+      stage: prod               # prod or alpha
+      deploymentGroup: us
+    primaryDeploymentGroup: uk  # optional, default uk
+```
+
+`provisionedConcurrency.yml`, one entry per function key:
+
+```yaml
+graphql:
+  statistic: maximum        # shared by every target, like targetUtilization and scaleInCooldown
+  targetUtilization: 0.8
+  prod:
+    min: 3
+    max: 500
+    reserved: 800           # optional reservedConcurrency
+  alpha:
+    min: 1
+    max: 2
+  us-prod:                  # optional override for one deployment target, applied last
+    min: 10
+server:                     # a Lambda Managed Instances function
+  prod:
+    min: 3                  # FunctionScalingConfig.MinExecutionEnvironments
+    maxVCpuCount: 400       # MaxVCpuCount of the capacity provider it references
+  alpha:
+    min: 3
+    maxVCpuCount: 40
+```
+
+Resolution:
+
+- every target of a stage shares that stage's block;
+- the prod target in the primary deployment group keeps `prod.min`; every other prod target gets
+  `max(alpha.min, 1)`, capped at `prod.min`;
+- a block keyed by the target's `deploymentTarget` overrides the result for that target.
+
+An entry with `max` sets the function's `provisionedConcurrency` (the floor) and
+`concurrencyAutoscaling` (`minimum`, `maximum`, `usage`, `scaleInCooldown`, and
+`customMetric.statistic`, default `average`). An entry with `maxVCpuCount` sets the Managed
+Instances function's `FunctionScalingConfig` in `resources.extensions` and the `MaxVCpuCount` of the
+capacity provider its `CapacityProviderConfig` references. Packaging fails if an entry matches no
+function, if the function also sets the properties the entry owns, or if a spec cannot resolve.
+
 ### Defaults
 
 ```yaml
