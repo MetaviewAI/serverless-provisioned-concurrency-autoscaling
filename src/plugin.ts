@@ -16,8 +16,10 @@ import {
   aliasManagedInstances,
   applyGeneratedConfig,
   dependMethodsOnManagedInstancePermissions,
+  LIVE_ALIAS,
   ManagedInstances,
   Naming,
+  permitManagedInstanceAliases,
 } from './generated'
 import { Logging } from 'serverless/classes/Plugin'
 
@@ -62,7 +64,7 @@ export default class Plugin {
       'after:package:compileFunctions': this.aliasManagedInstances.bind(this),
       'package:compileEvents': this.beforeDeployResources.bind(this),
       'after:package:compileEvents':
-        this.dependMethodsOnManagedInstancePermissions.bind(this),
+        this.permitManagedInstanceAliases.bind(this),
     }
   }
 
@@ -74,19 +76,46 @@ export default class Plugin {
     )
   }
 
-  aliasManagedInstances(): void {
+  async aliasManagedInstances(): Promise<void> {
+    const routed = new Set<string>()
+    for (const name of Object.keys(this.managedInstances)) {
+      if (await this.liveAliasExists(name)) routed.add(name)
+    }
     aliasManagedInstances(
       this.serverless.service,
       this.managedInstances,
       this.serverless.getProvider('aws').naming as unknown as Naming,
+      routed,
     )
   }
 
-  dependMethodsOnManagedInstancePermissions(): void {
+  async liveAliasExists(name: string): Promise<boolean> {
+    try {
+      await this.serverless
+        .getProvider('aws')
+        .request('Lambda', 'getAlias', {
+          FunctionName: this.serverless.service.getFunction(name).name,
+          Name: LIVE_ALIAS,
+        })
+      return true
+    } catch (error) {
+      if (error?.providerError?.statusCode === 404) return false
+      throw error
+    }
+  }
+
+  permitManagedInstanceAliases(): void {
+    const naming = this.serverless.getProvider('aws')
+      .naming as unknown as Naming
+    permitManagedInstanceAliases(
+      this.serverless.service,
+      this.managedInstances,
+      naming,
+    )
     dependMethodsOnManagedInstancePermissions(
       this.serverless.service,
       this.managedInstances,
-      this.serverless.getProvider('aws').naming as unknown as Naming,
+      naming,
     )
   }
 

@@ -32,8 +32,11 @@ import { AwsFunctionConfig } from './@types'
 // A Managed Instances function is served through a `live` alias on a numbered version, never
 // through $LATEST.PUBLISHED: every republish of $LATEST.PUBLISHED orphans a copy of the previous
 // package in the account's code storage, which no API lists or frees. The function is versioned on
-// every deploy with PublishToLatestPublished off, each version holds `min` execution environments,
-// and its events invoke the alias.
+// every deploy, each version holds `min` execution environments, and the alias has its own API
+// Gateway permission. Events move onto the alias, and PublishToLatestPublished turns off, only once
+// the alias already exists in the account: a failed deploy that rolls back deletes resources it
+// created but leaves the API Gateway stage on the new deployment, so that deployment may only
+// invoke an alias and permission that survive the rollback.
 
 export interface Deploy {
   from?: string
@@ -212,7 +215,7 @@ function capacityProviderLogicalId(arn: unknown): string | undefined {
 }
 
 // The function-level FunctionScalingConfig governs the frozen $LATEST.PUBLISHED, which keeps
-// serving until each stage's first alias deploy moves API Gateway onto the alias. Once every stage
+// serving until the deploy that moves a stage's events onto the alias completes. Once every stage
 // has made that deploy, set this to true to deactivate $LATEST.PUBLISHED and release its capacity.
 const DEACTIVATE_LATEST_PUBLISHED = false
 
@@ -243,14 +246,10 @@ function applyManagedInstances(
     )
   }
   service.functions[name].versionFunction = true
-  functionResource.Properties.PublishToLatestPublished = false
-  functionResource.Properties.FunctionScalingConfig =
-    DEACTIVATE_LATEST_PUBLISHED
-      ? { MinExecutionEnvironments: 0, MaxExecutionEnvironments: 0 }
-      : {
-          ...functionResource.Properties.FunctionScalingConfig,
-          MinExecutionEnvironments: entry.min,
-        }
+  functionResource.Properties.FunctionScalingConfig = {
+    ...functionResource.Properties.FunctionScalingConfig,
+    MinExecutionEnvironments: entry.min,
+  }
   provider.Properties.CapacityProviderScalingConfig = {
     ...provider.Properties.CapacityProviderScalingConfig,
     MaxVCpuCount: entry.maxVCpuCount,
@@ -316,6 +315,9 @@ export interface Naming {
   getLambdaApiGatewayPermissionLogicalId(functionName: string): string
 }
 
+const liveAliasLogicalId = (naming: Naming, name: string): string =>
+  `${naming.getNormalizedFunctionName(name)}LiveLambdaAlias`
+
 const stableJson = (value: unknown): string =>
   Array.isArray(value)
     ? `[${value.map(stableJson).join(',')}]`
@@ -329,23 +331,32 @@ const stableJson = (value: unknown): string =>
 // The framework names a version after a digest of the function it compiled, which does not include
 // the properties `resources.extensions` lays over the function later (MemorySize and
 // CapacityProviderConfig live there). Folding those into the name publishes a new version when
-// only they change. FunctionScalingConfig is left out: it governs $LATEST.PUBLISHED, not versions.
+// only they change. FunctionScalingConfig and PublishToLatestPublished are left out: they govern
+// $LATEST.PUBLISHED, not versions.
 function versionLogicalIdWithExtensions(
   versionLogicalId: string,
   extension: Record<string, unknown> | undefined,
 ): string {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { FunctionScalingConfig, ...properties } = extension ?? {}
+  const {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    FunctionScalingConfig,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    PublishToLatestPublished,
+    ...properties
+  } = extension ?? {}
   const digest = createHash('sha256').update(stableJson(properties))
   return `${versionLogicalId}${digest.digest('hex').slice(0, 12)}`
 }
 
 // Runs after the framework compiles functions and before it compiles events, which read
 // `targetAlias` to point integrations and permissions at the alias and to make them depend on it.
+// `routed` names the functions whose alias already exists in the account; only their events move
+// onto it and only they stop publishing $LATEST.PUBLISHED, which serves the others' events.
 export function aliasManagedInstances(
   service: Service,
   managed: ManagedInstances,
   naming: Naming,
+  routed: ReadonlySet<string>,
 ): void {
   const template = service.provider.compiledCloudFormationTemplate
   for (const [name, min] of Object.entries(managed)) {
@@ -378,7 +389,7 @@ export function aliasManagedInstances(
     version.Properties.FunctionScalingConfig = {
       MinExecutionEnvironments: min,
     }
-    const aliasLogicalId = `${naming.getNormalizedFunctionName(name)}LiveLambdaAlias`
+    const aliasLogicalId = liveAliasLogicalId(naming, name)
     template.Resources[aliasLogicalId] = {
       Type: 'AWS::Lambda::Alias',
       Properties: {
@@ -388,7 +399,44 @@ export function aliasManagedInstances(
       },
       DependsOn: functionLogicalId,
     }
+    if (!routed.has(name)) continue
+
+    const properties =
+      service.resources.extensions[functionLogicalId].Properties
+    properties.PublishToLatestPublished = false
+    if (DEACTIVATE_LATEST_PUBLISHED) {
+      properties.FunctionScalingConfig = {
+        MinExecutionEnvironments: 0,
+        MaxExecutionEnvironments: 0,
+      }
+    }
     fn.targetAlias = { name: LIVE_ALIAS, logicalId: aliasLogicalId }
+  }
+}
+
+// Gives each live alias its own API Gateway permission, a copy of the framework's with the alias as
+// its target, so it exists before the deploy that routes events to the alias and outlives that
+// deploy's rollback. The framework's permission follows targetAlias and is replaced by that deploy.
+// Runs after the framework compiles events.
+export function permitManagedInstanceAliases(
+  service: Service,
+  managed: ManagedInstances,
+  naming: Naming,
+): void {
+  const resources = service.provider.compiledCloudFormationTemplate.Resources
+  for (const name of Object.keys(managed)) {
+    const permission =
+      resources[naming.getLambdaApiGatewayPermissionLogicalId(name)]
+    if (permission === undefined) continue
+    const aliasLogicalId = liveAliasLogicalId(naming, name)
+    resources[`${naming.getNormalizedFunctionName(name)}LiveLambdaPermissionApiGateway`] = {
+      Type: 'AWS::Lambda::Permission',
+      Properties: {
+        ...permission.Properties,
+        FunctionName: { Ref: aliasLogicalId },
+      },
+      DependsOn: aliasLogicalId,
+    }
   }
 }
 
@@ -405,8 +453,9 @@ export function dependMethodsOnManagedInstancePermissions(
   for (const name of Object.keys(managed)) {
     const permissionLogicalId =
       naming.getLambdaApiGatewayPermissionLogicalId(name)
-    if (resources[permissionLogicalId] === undefined) continue
-    const aliasLogicalId = service.functions[name].targetAlias.logicalId
+    const aliasLogicalId = service.functions[name].targetAlias?.logicalId
+    if (resources[permissionLogicalId] === undefined || !aliasLogicalId)
+      continue
     for (const resource of Object.values(resources) as Service[]) {
       if (resource.Type !== 'AWS::ApiGateway::Method') continue
       const dependsOn: string[] = [resource.DependsOn ?? []].flat()
