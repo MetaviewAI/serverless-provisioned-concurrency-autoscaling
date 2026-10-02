@@ -153,6 +153,13 @@ A floor above 0 sets the function's `provisionedConcurrency` and `concurrencyAut
 `resources.extensions` and the `MaxVCpuCount` of the capacity provider its
 `CapacityProviderConfig` references; `maxFloor` does not apply to it.
 
+A Managed Instances function is served through a `live` alias on a numbered version instead of
+`$LATEST.PUBLISHED`, because each republish of `$LATEST.PUBLISHED` leaks a copy of the previous
+package into the account's code storage. The plugin versions the function on every deploy with
+`PublishToLatestPublished: false`, gives each version `min` execution environments, and points the
+function's events and their Lambda permissions at the alias. A change to the function's
+`resources.extensions` properties alone (such as `MemorySize`) also publishes a new version.
+
 Packaging fails on a block or target not listed in `deploys`, an unknown setting, a block with a
 ceiling but no floor, `min > max`, or a function that also sets `provisionedConcurrency` or
 `concurrencyAutoscaling` itself.

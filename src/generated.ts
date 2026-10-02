@@ -1,3 +1,4 @@
+import { createHash } from 'crypto'
 import { AwsFunctionConfig } from './@types'
 
 // Generated configuration: a function declares its concurrency per deploy, in blocks named after
@@ -27,6 +28,12 @@ import { AwsFunctionConfig } from './@types'
 // Lambda Managed Instances function: `min` becomes its FunctionScalingConfig.MinExecutionEnvironments
 // and `maxVCpuCount` the MaxVCpuCount of the capacity provider its CapacityProviderConfig
 // references (both in `resources`); `maxFloor` does not apply to it.
+//
+// A Managed Instances function is served through a `live` alias on a numbered version, never
+// through $LATEST.PUBLISHED: every republish of $LATEST.PUBLISHED orphans a copy of the previous
+// package in the account's code storage, which no API lists or frees. The function is versioned on
+// every deploy with PublishToLatestPublished off, each version holds `min` execution environments,
+// and its events invoke the alias.
 
 export interface Deploy {
   from?: string
@@ -204,6 +211,16 @@ function capacityProviderLogicalId(arn: unknown): string | undefined {
   return undefined
 }
 
+// The function-level FunctionScalingConfig governs the frozen $LATEST.PUBLISHED, which keeps
+// serving until each stage's first alias deploy moves API Gateway onto the alias. Once every stage
+// has made that deploy, set this to true to deactivate $LATEST.PUBLISHED and release its capacity.
+const DEACTIVATE_LATEST_PUBLISHED = false
+
+// Functions served by the `live` alias, with the execution environments each version holds.
+export type ManagedInstances = Record<string, number>
+
+export const LIVE_ALIAS = 'live'
+
 function applyManagedInstances(
   service: Service,
   name: string,
@@ -225,10 +242,15 @@ function applyManagedInstances(
         'does not reference an AWS::Lambda::CapacityProvider in resources.Resources',
     )
   }
-  functionResource.Properties.FunctionScalingConfig = {
-    ...functionResource.Properties.FunctionScalingConfig,
-    MinExecutionEnvironments: entry.min,
-  }
+  service.functions[name].versionFunction = true
+  functionResource.Properties.PublishToLatestPublished = false
+  functionResource.Properties.FunctionScalingConfig =
+    DEACTIVATE_LATEST_PUBLISHED
+      ? { MinExecutionEnvironments: 0, MaxExecutionEnvironments: 0 }
+      : {
+          ...functionResource.Properties.FunctionScalingConfig,
+          MinExecutionEnvironments: entry.min,
+        }
   provider.Properties.CapacityProviderScalingConfig = {
     ...provider.Properties.CapacityProviderScalingConfig,
     MaxVCpuCount: entry.maxVCpuCount,
@@ -263,11 +285,12 @@ export function applyEntry(
 export function applyGeneratedConfig(
   service: Service,
   lambdaLogicalId: (functionName: string) => string,
-): void {
+): ManagedInstances {
+  const managed: ManagedInstances = {}
   const declared = Object.entries(service.functions ?? {}).filter(
     ([, fn]) => isBlock(fn) && fn.concurrency !== undefined,
   )
-  if (declared.length === 0) return
+  if (declared.length === 0) return managed
 
   const selection = selectDeploy(
     service.custom?.provisionedConcurrencyAutoscaling,
@@ -281,5 +304,89 @@ export function applyGeneratedConfig(
     )
     delete definition.concurrency
     applyEntry(service, name, entry, lambdaLogicalId)
+    if (entry.maxVCpuCount !== undefined) managed[name] = entry.min
+  }
+  return managed
+}
+
+export interface Naming {
+  getLambdaLogicalId(functionName: string): string
+  getNormalizedFunctionName(functionName: string): string
+  getLambdaVersionOutputLogicalId(functionName: string): string
+}
+
+const stableJson = (value: unknown): string =>
+  Array.isArray(value)
+    ? `[${value.map(stableJson).join(',')}]`
+    : isBlock(value)
+      ? `{${Object.keys(value)
+          .sort()
+          .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+          .join(',')}}`
+      : JSON.stringify(value)
+
+// The framework names a version after a digest of the function it compiled, which does not include
+// the properties `resources.extensions` lays over the function later (MemorySize and
+// CapacityProviderConfig live there). Folding those into the name publishes a new version when
+// only they change. FunctionScalingConfig is left out: it governs $LATEST.PUBLISHED, not versions.
+function versionLogicalIdWithExtensions(
+  versionLogicalId: string,
+  extension: Record<string, unknown> | undefined,
+): string {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { FunctionScalingConfig, ...properties } = extension ?? {}
+  const digest = createHash('sha256').update(stableJson(properties))
+  return `${versionLogicalId}${digest.digest('hex').slice(0, 12)}`
+}
+
+// Runs after the framework compiles functions and before it compiles events, which read
+// `targetAlias` to point integrations and permissions at the alias and to make them depend on it.
+export function aliasManagedInstances(
+  service: Service,
+  managed: ManagedInstances,
+  naming: Naming,
+): void {
+  const template = service.provider.compiledCloudFormationTemplate
+  for (const [name, min] of Object.entries(managed)) {
+    const fn = service.functions[name]
+    const functionLogicalId = naming.getLambdaLogicalId(name)
+    const version = template.Resources[fn.versionLogicalId]
+    if (version?.Type !== 'AWS::Lambda::Version') {
+      throw new Error(
+        `Managed Instances function "${name}" has no compiled AWS::Lambda::Version to alias`,
+      )
+    }
+    if (fn.targetAlias !== undefined) {
+      throw new Error(
+        `Managed Instances function "${name}" already targets alias "${fn.targetAlias.name}"; ` +
+          'remove provisionedConcurrency, snapStart or durableConfig',
+      )
+    }
+
+    const versionLogicalId = versionLogicalIdWithExtensions(
+      fn.versionLogicalId,
+      service.resources?.extensions?.[functionLogicalId]?.Properties,
+    )
+    delete template.Resources[fn.versionLogicalId]
+    template.Resources[versionLogicalId] = version
+    fn.versionLogicalId = versionLogicalId
+    const output =
+      template.Outputs?.[naming.getLambdaVersionOutputLogicalId(name)]
+    if (output) output.Value = { Ref: versionLogicalId }
+
+    version.Properties.FunctionScalingConfig = {
+      MinExecutionEnvironments: min,
+    }
+    const aliasLogicalId = `${naming.getNormalizedFunctionName(name)}LiveLambdaAlias`
+    template.Resources[aliasLogicalId] = {
+      Type: 'AWS::Lambda::Alias',
+      Properties: {
+        FunctionName: { Ref: functionLogicalId },
+        FunctionVersion: { 'Fn::GetAtt': [versionLogicalId, 'Version'] },
+        Name: LIVE_ALIAS,
+      },
+      DependsOn: functionLogicalId,
+    }
+    fn.targetAlias = { name: LIVE_ALIAS, logicalId: aliasLogicalId }
   }
 }
