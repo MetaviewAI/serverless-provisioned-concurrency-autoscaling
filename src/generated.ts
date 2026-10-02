@@ -417,6 +417,9 @@ export function aliasManagedInstances(
 // Gives each live alias its own API Gateway permission, a copy of the framework's with the alias as
 // its target, so it exists before the deploy that routes events to the alias and outlives that
 // deploy's rollback. The framework's permission follows targetAlias and is replaced by that deploy.
+// The unqualified function keeps a permission of its own too: API Gateway takes a few seconds to
+// propagate a stage update, and the stage's previous deployment invokes the unqualified function
+// until it does, so deleting the replaced permission in cleanup returned 500s for that window.
 // Runs after the framework compiles events.
 export function permitManagedInstanceAliases(
   service: Service,
@@ -429,13 +432,26 @@ export function permitManagedInstanceAliases(
       resources[naming.getLambdaApiGatewayPermissionLogicalId(name)]
     if (permission === undefined) continue
     const aliasLogicalId = liveAliasLogicalId(naming, name)
-    resources[`${naming.getNormalizedFunctionName(name)}LiveLambdaPermissionApiGateway`] = {
+    resources[
+      `${naming.getNormalizedFunctionName(name)}LiveLambdaPermissionApiGateway`
+    ] = {
       Type: 'AWS::Lambda::Permission',
       Properties: {
         ...permission.Properties,
         FunctionName: { Ref: aliasLogicalId },
       },
       DependsOn: aliasLogicalId,
+    }
+    resources[
+      `${naming.getNormalizedFunctionName(name)}UnqualifiedLambdaPermissionApiGateway`
+    ] = {
+      Type: 'AWS::Lambda::Permission',
+      Properties: {
+        ...permission.Properties,
+        FunctionName: {
+          'Fn::GetAtt': [naming.getLambdaLogicalId(name), 'Arn'],
+        },
+      },
     }
   }
 }

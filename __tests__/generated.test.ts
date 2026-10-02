@@ -437,9 +437,9 @@ describe('aliasManagedInstances', () => {
 
     // Then
     const { Resources } = service.provider.compiledCloudFormationTemplate
-    expect(Resources.ServerLiveLambdaAlias.Properties.FunctionVersion).toEqual(
-      { 'Fn::GetAtt': [service.functions.server.versionLogicalId, 'Version'] },
-    )
+    expect(Resources.ServerLiveLambdaAlias.Properties.FunctionVersion).toEqual({
+      'Fn::GetAtt': [service.functions.server.versionLogicalId, 'Version'],
+    })
     expect(service.functions.server.targetAlias).toBeUndefined()
     expect(
       service.resources.extensions.ServerLambdaFunction.Properties,
@@ -544,7 +544,7 @@ describe('permitManagedInstanceAliases', () => {
     ['before events move onto the alias', new Set<string>()],
     ['after events move onto the alias', routed],
   ])(
-    'gives the alias the same permission %s',
+    'gives the alias and the unqualified function the same permission %s',
     (_, routedFunctions: Set<string>) => {
       // Given
       const service = managedService('uk-prod')
@@ -580,6 +580,18 @@ describe('permitManagedInstanceAliases', () => {
           SourceArn: sourceArn,
         },
         DependsOn: 'ServerLiveLambdaAlias',
+      })
+      expect(
+        service.provider.compiledCloudFormationTemplate.Resources
+          .ServerUnqualifiedLambdaPermissionApiGateway,
+      ).toEqual({
+        Type: 'AWS::Lambda::Permission',
+        Properties: {
+          FunctionName: { 'Fn::GetAtt': ['ServerLambdaFunction', 'Arn'] },
+          Action: 'lambda:InvokeFunction',
+          Principal: 'apigateway.amazonaws.com',
+          SourceArn: sourceArn,
+        },
       })
     },
   )
@@ -636,7 +648,11 @@ describe('Plugin generated configuration', () => {
   })
 
   it.each([
-    ['routes events to an existing alias', jest.fn().mockResolvedValue({}), 'live'],
+    [
+      'routes events to an existing alias',
+      jest.fn().mockResolvedValue({}),
+      'live',
+    ],
     [
       'keeps events off an alias the account does not have yet',
       jest.fn().mockRejectedValue({ providerError: { statusCode: 404 } }),
