@@ -313,6 +313,7 @@ export interface Naming {
   getLambdaLogicalId(functionName: string): string
   getNormalizedFunctionName(functionName: string): string
   getLambdaVersionOutputLogicalId(functionName: string): string
+  getLambdaApiGatewayPermissionLogicalId(functionName: string): string
 }
 
 const stableJson = (value: unknown): string =>
@@ -388,5 +389,33 @@ export function aliasManagedInstances(
       DependsOn: functionLogicalId,
     }
     fn.targetAlias = { name: LIVE_ALIAS, logicalId: aliasLogicalId }
+  }
+}
+
+// The framework makes each http method depend on its function's API Gateway permission, but merging
+// a custom authorizer's DependsOn into the method overwrites that entry. Moving a function onto the
+// alias replaces the permission, so without the dependency the stage deployment can route requests
+// to the alias before API Gateway may invoke it. Runs after the framework compiles events.
+export function dependMethodsOnManagedInstancePermissions(
+  service: Service,
+  managed: ManagedInstances,
+  naming: Naming,
+): void {
+  const resources = service.provider.compiledCloudFormationTemplate.Resources
+  for (const name of Object.keys(managed)) {
+    const permissionLogicalId =
+      naming.getLambdaApiGatewayPermissionLogicalId(name)
+    if (resources[permissionLogicalId] === undefined) continue
+    const aliasLogicalId = service.functions[name].targetAlias.logicalId
+    for (const resource of Object.values(resources) as Service[]) {
+      if (resource.Type !== 'AWS::ApiGateway::Method') continue
+      const dependsOn: string[] = [resource.DependsOn ?? []].flat()
+      if (
+        dependsOn.includes(aliasLogicalId) &&
+        !dependsOn.includes(permissionLogicalId)
+      ) {
+        resource.DependsOn = [...dependsOn, permissionLogicalId]
+      }
+    }
   }
 }

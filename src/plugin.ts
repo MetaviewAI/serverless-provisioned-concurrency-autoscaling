@@ -15,6 +15,7 @@ import { schema } from './schema/schema'
 import {
   aliasManagedInstances,
   applyGeneratedConfig,
+  dependMethodsOnManagedInstancePermissions,
   ManagedInstances,
   Naming,
 } from './generated'
@@ -60,6 +61,8 @@ export default class Plugin {
       // targetAlias when it compiles events in package:compileEvents, so the alias goes in between.
       'after:package:compileFunctions': this.aliasManagedInstances.bind(this),
       'package:compileEvents': this.beforeDeployResources.bind(this),
+      'after:package:compileEvents':
+        this.dependMethodsOnManagedInstancePermissions.bind(this),
     }
   }
 
@@ -73,6 +76,14 @@ export default class Plugin {
 
   aliasManagedInstances(): void {
     aliasManagedInstances(
+      this.serverless.service,
+      this.managedInstances,
+      this.serverless.getProvider('aws').naming as unknown as Naming,
+    )
+  }
+
+  dependMethodsOnManagedInstancePermissions(): void {
+    dependMethodsOnManagedInstancePermissions(
       this.serverless.service,
       this.managedInstances,
       this.serverless.getProvider('aws').naming as unknown as Naming,

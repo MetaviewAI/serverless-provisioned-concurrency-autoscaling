@@ -2,6 +2,7 @@
 import Plugin from '../src/plugin'
 import {
   aliasManagedInstances,
+  dependMethodsOnManagedInstancePermissions,
   applyGeneratedConfig,
   Deploy,
   resolveEntry,
@@ -331,6 +332,8 @@ const naming = {
     `${name[0].toUpperCase()}${name.slice(1)}`,
   getLambdaVersionOutputLogicalId: (name: string) =>
     `${logicalId(name)}QualifiedArn`,
+  getLambdaApiGatewayPermissionLogicalId: (name: string) =>
+    `${naming.getNormalizedFunctionName(name)}LambdaPermissionApiGateway`,
 }
 
 // What the framework's package:compileFunctions leaves for a versioned function.
@@ -445,6 +448,41 @@ describe('aliasManagedInstances', () => {
     expect(() =>
       aliasManagedInstances(aliased, aliasedManaged, naming),
     ).toThrow('already targets alias "snap"')
+  })
+})
+
+describe('dependMethodsOnManagedInstancePermissions', () => {
+  it('makes methods routed to the alias depend on its permission', () => {
+    // Given: the framework's DependsOn after an authorizer overwrote the permission entry
+    const service = managedService('uk-prod')
+    const managed = applyGeneratedConfig(service, logicalId)
+    compileFunctions(service)
+    aliasManagedInstances(service, managed, naming)
+    Object.assign(service.provider.compiledCloudFormationTemplate.Resources, {
+      ServerLambdaPermissionApiGateway: { Type: 'AWS::Lambda::Permission' },
+      ApiGatewayMethodAny: {
+        Type: 'AWS::ApiGateway::Method',
+        DependsOn: ['Authorizer', 'ServerLiveLambdaAlias'],
+      },
+      ApiGatewayMethodPlainGet: {
+        Type: 'AWS::ApiGateway::Method',
+        DependsOn: ['PlainLambdaPermissionApiGateway'],
+      },
+    })
+
+    // When
+    dependMethodsOnManagedInstancePermissions(service, managed, naming)
+
+    // Then
+    const { Resources } = service.provider.compiledCloudFormationTemplate
+    expect(Resources.ApiGatewayMethodAny.DependsOn).toEqual([
+      'Authorizer',
+      'ServerLiveLambdaAlias',
+      'ServerLambdaPermissionApiGateway',
+    ])
+    expect(Resources.ApiGatewayMethodPlainGet.DependsOn).toEqual([
+      'PlainLambdaPermissionApiGateway',
+    ])
   })
 })
 
