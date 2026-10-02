@@ -1,6 +1,13 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import Plugin from '../src/plugin'
-import { applyGeneratedConfig, Deploy, resolveEntry } from '../src/generated'
+import {
+  aliasManagedInstances,
+  dependMethodsOnManagedInstancePermissions,
+  permitManagedInstanceAliases,
+  applyGeneratedConfig,
+  Deploy,
+  resolveEntry,
+} from '../src/generated'
 
 const deploys: Record<string, Deploy> = {
   'uk-prod': {},
@@ -36,6 +43,45 @@ const serviceWith = (target: string, functions: any, resources?: any): any => ({
   functions,
   resources,
 })
+
+const managedService = (target: string): any =>
+  serviceWith(
+    target,
+    {
+      server: {
+        handler: 's',
+        concurrency: {
+          'uk-prod': { min: 3, maxVCpuCount: 400 },
+          'uk-alpha': { min: 1, maxVCpuCount: 40 },
+        },
+      },
+      plain: { handler: 'p' },
+    },
+    {
+      Resources: {
+        ServerProvider: {
+          Type: 'AWS::Lambda::CapacityProvider',
+          Properties: {
+            CapacityProviderScalingConfig: { ScalingMode: 'Auto' },
+          },
+        },
+      },
+      extensions: {
+        ServerLambdaFunction: {
+          Properties: {
+            MemorySize: 4096,
+            CapacityProviderConfig: {
+              LambdaManagedInstancesCapacityProviderConfig: {
+                CapacityProviderArn: {
+                  'Fn::GetAtt': ['ServerProvider', 'Arn'],
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  )
 
 describe('resolveEntry', () => {
   it('reads the block named after the target, with the shared settings', () => {
@@ -197,54 +243,22 @@ describe('applyGeneratedConfig', () => {
     })
   })
 
-  it('sizes a Managed Instances function and its capacity provider', () => {
+  it('sizes a Managed Instances function and versions it instead of republishing $LATEST.PUBLISHED', () => {
     // Given
-    const service = serviceWith(
-      'uk-prod',
-      {
-        server: {
-          handler: 's',
-          concurrency: {
-            'uk-prod': { min: 3, maxVCpuCount: 400 },
-            'uk-alpha': { min: 3, maxVCpuCount: 40 },
-          },
-        },
-      },
-      {
-        Resources: {
-          ServerProvider: {
-            Type: 'AWS::Lambda::CapacityProvider',
-            Properties: {
-              CapacityProviderScalingConfig: { ScalingMode: 'Auto' },
-            },
-          },
-        },
-        extensions: {
-          ServerLambdaFunction: {
-            Properties: {
-              MemorySize: 4096,
-              CapacityProviderConfig: {
-                LambdaManagedInstancesCapacityProviderConfig: {
-                  CapacityProviderArn: {
-                    'Fn::GetAtt': ['ServerProvider', 'Arn'],
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-    )
+    const service = managedService('uk-prod')
 
     // When
-    applyGeneratedConfig(service, logicalId)
+    const managed = applyGeneratedConfig(service, logicalId)
 
     // Then
-    expect(service.functions.server).toEqual({ handler: 's' })
-    expect(
-      service.resources.extensions.ServerLambdaFunction.Properties
-        .FunctionScalingConfig,
-    ).toEqual({
+    expect(managed).toEqual({ server: 3 })
+    expect(service.functions.server).toEqual({
+      handler: 's',
+      versionFunction: true,
+    })
+    const { Properties } = service.resources.extensions.ServerLambdaFunction
+    expect(Properties.PublishToLatestPublished).toBeUndefined()
+    expect(Properties.FunctionScalingConfig).toEqual({
       MinExecutionEnvironments: 3,
     })
     expect(
@@ -313,11 +327,287 @@ describe('applyGeneratedConfig', () => {
   })
 })
 
+const routed = new Set(['server'])
+
+const naming = {
+  getLambdaLogicalId: logicalId,
+  getNormalizedFunctionName: (name: string) =>
+    `${name[0].toUpperCase()}${name.slice(1)}`,
+  getLambdaVersionOutputLogicalId: (name: string) =>
+    `${logicalId(name)}QualifiedArn`,
+  getLambdaApiGatewayPermissionLogicalId: (name: string) =>
+    `${naming.getNormalizedFunctionName(name)}LambdaPermissionApiGateway`,
+}
+
+// What the framework's package:compileFunctions leaves for a versioned function.
+const compileFunctions = (service: any): void => {
+  service.provider = {
+    ...service.provider,
+    compiledCloudFormationTemplate: {
+      Resources: {
+        ServerLambdaFunction: { Type: 'AWS::Lambda::Function' },
+        ServerLambdaVersionAbc: {
+          Type: 'AWS::Lambda::Version',
+          DeletionPolicy: 'Retain',
+          Properties: {
+            FunctionName: { Ref: 'ServerLambdaFunction' },
+            CodeSha256: 'sha',
+          },
+        },
+        PlainLambdaFunction: { Type: 'AWS::Lambda::Function' },
+      },
+      Outputs: {
+        ServerLambdaFunctionQualifiedArn: {
+          Value: { Ref: 'ServerLambdaVersionAbc' },
+        },
+      },
+    },
+  }
+  service.functions.server.versionLogicalId = 'ServerLambdaVersionAbc'
+}
+
+const versionIdAfterAliasing = (target: string, extension: any): string => {
+  const service = managedService(target)
+  const managed = applyGeneratedConfig(service, logicalId)
+  Object.assign(
+    service.resources.extensions.ServerLambdaFunction.Properties,
+    extension,
+  )
+  compileFunctions(service)
+  aliasManagedInstances(service, managed, naming, routed)
+  return service.functions.server.versionLogicalId
+}
+
+describe('aliasManagedInstances', () => {
+  it('serves a Managed Instances function through a live alias on its new version', () => {
+    // Given
+    const service = managedService('uk-prod')
+    const managed = applyGeneratedConfig(service, logicalId)
+    compileFunctions(service)
+
+    // When
+    aliasManagedInstances(service, managed, naming, routed)
+
+    // Then
+    expect(
+      service.resources.extensions.ServerLambdaFunction.Properties
+        .PublishToLatestPublished,
+    ).toBe(false)
+    const { Resources, Outputs } =
+      service.provider.compiledCloudFormationTemplate
+    const versionId = service.functions.server.versionLogicalId
+    expect(versionId).toMatch(/^ServerLambdaVersionAbc[0-9a-f]{12}$/)
+    expect(Resources.ServerLambdaVersionAbc).toBeUndefined()
+    expect(Resources[versionId]).toEqual({
+      Type: 'AWS::Lambda::Version',
+      DeletionPolicy: 'Retain',
+      Properties: {
+        FunctionName: { Ref: 'ServerLambdaFunction' },
+        CodeSha256: 'sha',
+        FunctionScalingConfig: { MinExecutionEnvironments: 3 },
+      },
+    })
+    expect(Resources.ServerLiveLambdaAlias).toEqual({
+      Type: 'AWS::Lambda::Alias',
+      Properties: {
+        FunctionName: { Ref: 'ServerLambdaFunction' },
+        FunctionVersion: { 'Fn::GetAtt': [versionId, 'Version'] },
+        Name: 'live',
+      },
+      DependsOn: 'ServerLambdaFunction',
+    })
+    expect(Outputs.ServerLambdaFunctionQualifiedArn.Value).toEqual({
+      Ref: versionId,
+    })
+    expect(service.functions.server.targetAlias).toEqual({
+      name: 'live',
+      logicalId: 'ServerLiveLambdaAlias',
+    })
+    expect(service.functions.plain.targetAlias).toBeUndefined()
+  })
+
+  it('creates the alias but leaves events on $LATEST.PUBLISHED until the alias exists', () => {
+    // Given
+    const service = managedService('uk-prod')
+    const managed = applyGeneratedConfig(service, logicalId)
+    compileFunctions(service)
+
+    // When
+    aliasManagedInstances(service, managed, naming, new Set())
+
+    // Then
+    const { Resources } = service.provider.compiledCloudFormationTemplate
+    expect(Resources.ServerLiveLambdaAlias.Properties.FunctionVersion).toEqual({
+      'Fn::GetAtt': [service.functions.server.versionLogicalId, 'Version'],
+    })
+    expect(service.functions.server.targetAlias).toBeUndefined()
+    expect(
+      service.resources.extensions.ServerLambdaFunction.Properties,
+    ).not.toHaveProperty('PublishToLatestPublished')
+  })
+
+  it('names the version the same before and after events move onto the alias', () => {
+    // Given
+    const before = managedService('uk-prod')
+    const after = managedService('uk-prod')
+    for (const service of [before, after]) compileFunctions(service)
+
+    // When
+    aliasManagedInstances(
+      before,
+      applyGeneratedConfig(before, logicalId),
+      naming,
+      new Set(),
+    )
+    aliasManagedInstances(
+      after,
+      applyGeneratedConfig(after, logicalId),
+      naming,
+      routed,
+    )
+
+    // Then
+    expect(after.functions.server.versionLogicalId).toBe(
+      before.functions.server.versionLogicalId,
+    )
+  })
+
+  it('publishes a new version when only the extension properties change', () => {
+    // Given / When
+    const baseline = versionIdAfterAliasing('uk-prod', {})
+    const resized = versionIdAfterAliasing('uk-prod', { MemorySize: 8192 })
+    const rescaled = versionIdAfterAliasing('uk-alpha', {})
+
+    // Then
+    expect(resized).not.toBe(baseline)
+    expect(rescaled).toBe(baseline)
+  })
+
+  it('rejects a function it cannot alias', () => {
+    // Given
+    const unversioned = managedService('uk-prod')
+    const unversionedManaged = applyGeneratedConfig(unversioned, logicalId)
+    compileFunctions(unversioned)
+    delete unversioned.functions.server.versionLogicalId
+    const aliased = managedService('uk-prod')
+    const aliasedManaged = applyGeneratedConfig(aliased, logicalId)
+    compileFunctions(aliased)
+    aliased.functions.server.targetAlias = { name: 'snap', logicalId: 'X' }
+
+    // When / Then
+    expect(() =>
+      aliasManagedInstances(unversioned, unversionedManaged, naming, routed),
+    ).toThrow('has no compiled AWS::Lambda::Version')
+    expect(() =>
+      aliasManagedInstances(aliased, aliasedManaged, naming, routed),
+    ).toThrow('already targets alias "snap"')
+  })
+})
+
+describe('dependMethodsOnManagedInstancePermissions', () => {
+  it('makes methods routed to the alias depend on its permission', () => {
+    // Given: the framework's DependsOn after an authorizer overwrote the permission entry
+    const service = managedService('uk-prod')
+    const managed = applyGeneratedConfig(service, logicalId)
+    compileFunctions(service)
+    aliasManagedInstances(service, managed, naming, routed)
+    Object.assign(service.provider.compiledCloudFormationTemplate.Resources, {
+      ServerLambdaPermissionApiGateway: { Type: 'AWS::Lambda::Permission' },
+      ApiGatewayMethodAny: {
+        Type: 'AWS::ApiGateway::Method',
+        DependsOn: ['Authorizer', 'ServerLiveLambdaAlias'],
+      },
+      ApiGatewayMethodPlainGet: {
+        Type: 'AWS::ApiGateway::Method',
+        DependsOn: ['PlainLambdaPermissionApiGateway'],
+      },
+    })
+
+    // When
+    dependMethodsOnManagedInstancePermissions(service, managed, naming)
+
+    // Then
+    const { Resources } = service.provider.compiledCloudFormationTemplate
+    expect(Resources.ApiGatewayMethodAny.DependsOn).toEqual([
+      'Authorizer',
+      'ServerLiveLambdaAlias',
+      'ServerLambdaPermissionApiGateway',
+    ])
+    expect(Resources.ApiGatewayMethodPlainGet.DependsOn).toEqual([
+      'PlainLambdaPermissionApiGateway',
+    ])
+  })
+})
+
+describe('permitManagedInstanceAliases', () => {
+  it.each([
+    ['before events move onto the alias', new Set<string>()],
+    ['after events move onto the alias', routed],
+  ])(
+    'gives the alias and the unqualified function the same permission %s',
+    (_, routedFunctions: Set<string>) => {
+      // Given
+      const service = managedService('uk-prod')
+      const managed = applyGeneratedConfig(service, logicalId)
+      compileFunctions(service)
+      aliasManagedInstances(service, managed, naming, routedFunctions)
+      const sourceArn = { 'Fn::Join': ['', ['arn:', 'api', '/*/*']] }
+      Object.assign(service.provider.compiledCloudFormationTemplate.Resources, {
+        ServerLambdaPermissionApiGateway: {
+          Type: 'AWS::Lambda::Permission',
+          Properties: {
+            FunctionName: { 'Fn::GetAtt': ['ServerLambdaFunction', 'Arn'] },
+            Action: 'lambda:InvokeFunction',
+            Principal: 'apigateway.amazonaws.com',
+            SourceArn: sourceArn,
+          },
+        },
+      })
+
+      // When
+      permitManagedInstanceAliases(service, managed, naming)
+
+      // Then
+      expect(
+        service.provider.compiledCloudFormationTemplate.Resources
+          .ServerLiveLambdaPermissionApiGateway,
+      ).toEqual({
+        Type: 'AWS::Lambda::Permission',
+        Properties: {
+          FunctionName: { Ref: 'ServerLiveLambdaAlias' },
+          Action: 'lambda:InvokeFunction',
+          Principal: 'apigateway.amazonaws.com',
+          SourceArn: sourceArn,
+        },
+        DependsOn: 'ServerLiveLambdaAlias',
+      })
+      expect(
+        service.provider.compiledCloudFormationTemplate.Resources
+          .ServerUnqualifiedLambdaPermissionApiGateway,
+      ).toEqual({
+        Type: 'AWS::Lambda::Permission',
+        Properties: {
+          FunctionName: { 'Fn::GetAtt': ['ServerLambdaFunction', 'Arn'] },
+          Action: 'lambda:InvokeFunction',
+          Principal: 'apigateway.amazonaws.com',
+          SourceArn: sourceArn,
+        },
+      })
+    },
+  )
+})
+
 describe('Plugin generated configuration', () => {
   const logging: any = { log: { info: jest.fn() } }
-  const serverlessWith = (service: any): any => ({
-    service: { provider: { name: 'aws' }, ...service },
-    getProvider: () => ({ naming: { getLambdaLogicalId: logicalId } }),
+  const serverlessWith = (service: any, request = jest.fn()): any => ({
+    service: {
+      provider: { name: 'aws' },
+      ...service,
+      getFunction(name: string) {
+        return this.functions[name]
+      },
+    },
+    getProvider: () => ({ naming, request }),
     configSchemaHandler: { defineFunctionProperties: jest.fn() },
   })
 
@@ -355,5 +645,57 @@ describe('Plugin generated configuration', () => {
     expect(serverless.service.functions.graphql).toEqual({
       provisionedConcurrency: 1,
     })
+  })
+
+  it.each([
+    [
+      'routes events to an existing alias',
+      jest.fn().mockResolvedValue({}),
+      'live',
+    ],
+    [
+      'keeps events off an alias the account does not have yet',
+      jest.fn().mockRejectedValue({ providerError: { statusCode: 404 } }),
+      undefined,
+    ],
+  ])(
+    '%s after the framework compiles functions',
+    async (_, request: jest.Mock, targetAlias: string | undefined) => {
+      // Given
+      const service = managedService('uk-prod')
+      service.functions.server.name = 'svc-uk-prod-server'
+      const serverless = serverlessWith(service, request)
+      const plugin = new Plugin(serverless, {}, logging)
+      ;(plugin.hooks.initialize as () => void)()
+      compileFunctions(serverless.service)
+
+      // When
+      await (
+        plugin.hooks['after:package:compileFunctions'] as () => Promise<void>
+      )()
+
+      // Then
+      expect(request).toHaveBeenCalledWith('Lambda', 'getAlias', {
+        FunctionName: 'svc-uk-prod-server',
+        Name: 'live',
+      })
+      expect(serverless.service.functions.server.targetAlias?.name).toBe(
+        targetAlias,
+      )
+    },
+  )
+
+  it('fails packaging when it cannot tell whether the alias exists', async () => {
+    // Given
+    const request = jest.fn().mockRejectedValue(new Error('AccessDenied'))
+    const serverless = serverlessWith(managedService('uk-prod'), request)
+    const plugin = new Plugin(serverless, {}, logging)
+    ;(plugin.hooks.initialize as () => void)()
+    compileFunctions(serverless.service)
+
+    // When / Then
+    await expect(
+      (plugin.hooks['after:package:compileFunctions'] as () => Promise<void>)(),
+    ).rejects.toThrow('AccessDenied')
   })
 })

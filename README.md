@@ -153,6 +153,17 @@ A floor above 0 sets the function's `provisionedConcurrency` and `concurrencyAut
 `resources.extensions` and the `MaxVCpuCount` of the capacity provider its
 `CapacityProviderConfig` references; `maxFloor` does not apply to it.
 
+A Managed Instances function is served through a `live` alias on a numbered version instead of
+`$LATEST.PUBLISHED`, because each republish of `$LATEST.PUBLISHED` leaks a copy of the previous
+package into the account's code storage. The plugin versions the function on every deploy, gives
+each version `min` execution environments, and creates the alias with its own API Gateway
+permission. Packaging asks Lambda whether the alias exists: until it does, events stay on
+`$LATEST.PUBLISHED`; once it does, events and their Lambda permissions move onto the alias and
+`PublishToLatestPublished` turns off. The first deploy of a stage therefore only creates the alias
+and the second moves traffic, so a rolled-back deploy never leaves the API Gateway stage invoking
+an alias the rollback deleted. Packaging needs `lambda:GetAlias`. A change to the function's
+`resources.extensions` properties alone (such as `MemorySize`) also publishes a new version.
+
 Packaging fails on a block or target not listed in `deploys`, an unknown setting, a block with a
 ceiling but no floor, `min > max`, or a function that also sets `provisionedConcurrency` or
 `concurrencyAutoscaling` itself.
