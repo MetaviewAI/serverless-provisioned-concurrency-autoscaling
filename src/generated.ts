@@ -37,10 +37,16 @@ import { AwsFunctionConfig } from './@types'
 // the alias already exists in the account: a failed deploy that rolls back deletes resources it
 // created but leaves the API Gateway stage on the new deployment, so that deployment may only
 // invoke an alias and permission that survive the rollback.
+//
+// A deploy entry with `snapStart: true` (Lambda cannot combine SnapStart with provisioned
+// concurrency) gives every function whose block, before `maxFloor`, has a floor above 0 the
+// framework's `snapStart: true` instead of a warm pool. A function opts out with `snapStart: false`
+// outside its blocks and then resolves as above. Managed Instances entries are unaffected.
 
 export interface Deploy {
   from?: string
   maxFloor?: number
+  snapStart?: boolean
 }
 
 export interface GeneratedConfig {
@@ -57,6 +63,7 @@ export interface ResolvedEntry {
   targetUtilization?: number
   scaleInCooldown?: number
   statistic?: string
+  snapStart?: boolean
   [key: string]: unknown
 }
 
@@ -68,6 +75,9 @@ const SETTING_KEYS = [
   'scaleInCooldown',
   'statistic',
 ]
+
+// Settings allowed only outside the blocks.
+const SHARED_KEYS = [...SETTING_KEYS, 'snapStart']
 
 const isBlock = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -85,13 +95,12 @@ function validateBlocks(
       )
     }
     const settings = isBlock(value) ? Object.keys(value) : [key]
-    const unknown = settings.filter(
-      (setting) => !SETTING_KEYS.includes(setting),
-    )
+    const allowed = isBlock(value) ? SETTING_KEYS : SHARED_KEYS
+    const unknown = settings.filter((setting) => !allowed.includes(setting))
     if (unknown.length > 0) {
       throw new Error(
         `concurrency of function "${name}" has unknown setting ${unknown.join(', ')}; ` +
-          `expected ${SETTING_KEYS.join(', ')}`,
+          `expected ${allowed.join(', ')}`,
       )
     }
     if (
@@ -104,6 +113,12 @@ function validateBlocks(
           'provisioned concurrency cannot scale up from 0, so set min or omit max',
       )
     }
+  }
+  if (concurrency.snapStart !== undefined && concurrency.snapStart !== false) {
+    throw new Error(
+      `concurrency of function "${name}" sets snapStart ${concurrency.snapStart}; ` +
+        "only snapStart: false is supported, to opt out of a deploy's snapStart",
+    )
   }
 }
 
@@ -134,7 +149,7 @@ export function selectDeploy(config: GeneratedConfig | undefined): Selection {
     throw new Error(`deploy "${config.target}" must be a mapping`)
   }
   const deploy = entry as Deploy
-  const { from, maxFloor } = deploy
+  const { from, maxFloor, snapStart } = deploy
   if (from !== undefined && !deploys.includes(from)) {
     throw new Error(
       `deploy "${config.target}" borrows from unknown deploy "${from}"`,
@@ -148,7 +163,42 @@ export function selectDeploy(config: GeneratedConfig | undefined): Selection {
       `deploy "${config.target}" has maxFloor ${maxFloor}; expected an integer >= 0`,
     )
   }
+  if (snapStart !== undefined && typeof snapStart !== 'boolean') {
+    throw new Error(
+      `deploy "${config.target}" has snapStart ${snapStart}; expected true or false`,
+    )
+  }
   return { target: config.target, deploy, deploys }
+}
+
+function layerBlocks(
+  concurrency: ConcurrencyBlocks,
+  target: string,
+  from: string | undefined,
+  maxFloor?: number,
+): Record<string, unknown> {
+  const shared = Object.fromEntries(
+    Object.entries(concurrency).filter(
+      ([key, value]) => !isBlock(value) && key !== 'snapStart',
+    ),
+  )
+  const block = (key: string) => {
+    const value = concurrency[key]
+    return isBlock(value) ? value : {}
+  }
+
+  const resolved: Record<string, unknown> = { min: 0, ...shared }
+  if (from !== undefined) {
+    Object.assign(resolved, block(from))
+    if (maxFloor !== undefined && resolved.maxVCpuCount === undefined) {
+      resolved.min = Math.min(resolved.min as number, maxFloor)
+    }
+  }
+  Object.assign(resolved, block(target))
+  if (resolved.max === undefined && resolved.maxVCpuCount === undefined) {
+    resolved.max = 0
+  }
+  return resolved
 }
 
 export function resolveEntry(
@@ -157,25 +207,15 @@ export function resolveEntry(
   { target, deploy, deploys }: Selection,
 ): ResolvedEntry {
   validateBlocks(name, concurrency, deploys)
-  const shared = Object.fromEntries(
-    Object.entries(concurrency).filter(([, value]) => !isBlock(value)),
-  )
-  const block = (key: string) => {
-    const value = concurrency[key]
-    return isBlock(value) ? value : {}
-  }
-
-  const resolved: Record<string, unknown> = { min: 0, ...shared }
-  if (deploy.from !== undefined) {
-    Object.assign(resolved, block(deploy.from))
-    if (deploy.maxFloor !== undefined && resolved.maxVCpuCount === undefined) {
-      resolved.min = Math.min(resolved.min as number, deploy.maxFloor)
-    }
-  }
-  Object.assign(resolved, block(target))
-  if (resolved.max === undefined && resolved.maxVCpuCount === undefined) {
-    resolved.max = 0
-  }
+  const unfloored = layerBlocks(concurrency, target, deploy.from)
+  const snapStart =
+    deploy.snapStart === true &&
+    concurrency.snapStart !== false &&
+    unfloored.maxVCpuCount === undefined &&
+    (unfloored.min as number) > 0
+  const resolved = snapStart
+    ? { ...unfloored, snapStart: true }
+    : layerBlocks(concurrency, target, deploy.from, deploy.maxFloor)
 
   const { min, max, maxVCpuCount } = resolved
   const validMin = Number.isInteger(min) && (min as number) >= 0
@@ -273,6 +313,16 @@ export function applyEntry(
         `function "${name}" sets both ${key} and concurrency; remove one`,
       )
     }
+  }
+  if (fn.snapStart !== undefined && (entry.snapStart || entry.min > 0)) {
+    throw new Error(
+      `function "${name}" sets snapStart and its concurrency resolves to ` +
+        `${entry.snapStart ? 'SnapStart' : 'provisioned concurrency'}; remove one`,
+    )
+  }
+  if (entry.snapStart) {
+    fn.snapStart = true
+    return
   }
   // A floor of 0 means no warm pool: no alias, no scaling target.
   if (entry.min > 0) {
