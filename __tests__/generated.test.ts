@@ -327,6 +327,149 @@ describe('applyGeneratedConfig', () => {
   })
 })
 
+describe('snapStart deploys', () => {
+  const snapStartDeploys = {
+    ...deploys,
+    'us-prod': { from: 'uk-prod', maxFloor: 0, snapStart: true },
+  }
+  const snapStartService = (functions: any, resources?: any): any => ({
+    custom: {
+      provisionedConcurrencyAutoscaling: {
+        target: 'us-prod',
+        deploys: snapStartDeploys,
+      },
+    },
+    functions,
+    resources,
+  })
+
+  it('turns a borrowed floor above 0 into SnapStart, with no warm pool', () => {
+    // Given
+    const service = snapStartService({
+      graphql: { handler: 'g', concurrency: graphql },
+      own: { handler: 'o', concurrency: { 'us-prod': { min: 2, max: 4 } } },
+    })
+
+    // When
+    applyGeneratedConfig(service, logicalId)
+
+    // Then
+    expect(service.functions.graphql).toEqual({ handler: 'g', snapStart: true })
+    expect(service.functions.own).toEqual({ handler: 'o', snapStart: true })
+  })
+
+  it('leaves a function with a floor of 0 plain', () => {
+    // Given
+    const service = snapStartService({
+      authorizer: { handler: 'a', concurrency: { 'uk-alpha': { min: 1 } } },
+      zero: { handler: 'z', concurrency: { 'uk-prod': { min: 0 } } },
+    })
+
+    // When
+    applyGeneratedConfig(service, logicalId)
+
+    // Then
+    expect(service.functions.authorizer).toEqual({ handler: 'a' })
+    expect(service.functions.zero).toEqual({ handler: 'z' })
+  })
+
+  it('resolves an opted-out function as usual, floor capped at maxFloor', () => {
+    // Given
+    const service = snapStartService({
+      stream: {
+        handler: 's',
+        concurrency: { snapStart: false, ...graphql },
+      },
+      warm: {
+        handler: 'w',
+        concurrency: {
+          snapStart: false,
+          'uk-prod': { min: 120, max: 600 },
+          'us-prod': { min: 2 },
+        },
+      },
+    })
+
+    // When
+    applyGeneratedConfig(service, logicalId)
+
+    // Then
+    expect(service.functions.stream).toEqual({ handler: 's' })
+    expect(service.functions.warm.snapStart).toBeUndefined()
+    expect(service.functions.warm.provisionedConcurrency).toBe(2)
+    expect(service.functions.warm.concurrencyAutoscaling).toMatchObject({
+      minimum: 2,
+      maximum: 600,
+    })
+  })
+
+  it('leaves Managed Instances functions sized as borrowed', () => {
+    // Given
+    const service = managedService('us-prod')
+    service.custom.provisionedConcurrencyAutoscaling.deploys = snapStartDeploys
+
+    // When
+    const managed = applyGeneratedConfig(service, logicalId)
+
+    // Then
+    expect(managed).toEqual({ server: 3 })
+    expect(service.functions.server).toEqual({
+      handler: 's',
+      versionFunction: true,
+    })
+  })
+
+  it('rejects a snapStart that is ambiguous or not a boolean', () => {
+    // Given
+    const notBoolean = snapStartService({
+      graphql: { concurrency: graphql },
+    })
+    notBoolean.custom.provisionedConcurrencyAutoscaling.deploys = {
+      ...deploys,
+      'us-prod': { from: 'uk-prod', snapStart: 'yes' },
+    }
+    const optIn = snapStartService({
+      graphql: { concurrency: { snapStart: true, ...graphql } },
+    })
+    const inBlock = snapStartService({
+      graphql: { concurrency: { 'uk-prod': { min: 1, snapStart: false } } },
+    })
+    const alsoSnapStart = snapStartService({
+      graphql: { snapStart: true, concurrency: graphql },
+    })
+    const snapStartWithWarmPool = serviceWith('uk-prod', {
+      graphql: { snapStart: true, concurrency: graphql },
+    })
+    const snapStartWithoutWarmPool = serviceWith('uk-alpha', {
+      authorizer: { handler: 'a', snapStart: true, concurrency: authorizer },
+    })
+
+    // When / Then
+    expect(() => applyGeneratedConfig(notBoolean, logicalId)).toThrow(
+      'deploy "us-prod" has snapStart yes; expected true or false',
+    )
+    expect(() => applyGeneratedConfig(optIn, logicalId)).toThrow(
+      'only snapStart: false is supported',
+    )
+    expect(() => applyGeneratedConfig(inBlock, logicalId)).toThrow(
+      'unknown setting snapStart',
+    )
+    expect(() => applyGeneratedConfig(alsoSnapStart, logicalId)).toThrow(
+      'function "graphql" sets snapStart and its concurrency resolves to SnapStart',
+    )
+    expect(() =>
+      applyGeneratedConfig(snapStartWithWarmPool, logicalId),
+    ).toThrow(
+      'function "graphql" sets snapStart and its concurrency resolves to provisioned concurrency',
+    )
+    applyGeneratedConfig(snapStartWithoutWarmPool, logicalId)
+    expect(snapStartWithoutWarmPool.functions.authorizer).toEqual({
+      handler: 'a',
+      snapStart: true,
+    })
+  })
+})
+
 const routed = new Set(['server'])
 
 const naming = {

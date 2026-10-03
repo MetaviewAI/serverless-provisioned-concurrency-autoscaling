@@ -119,6 +119,7 @@ custom:
         maxFloor: 1                   # ...keeping at most 1 warm instance
       us-alpha:
         from: uk-alpha
+        snapStart: true               # SnapStart instead of a warm pool (see below)
 
 functions:
   graphql:
@@ -134,6 +135,12 @@ functions:
         max: 2
       us-prod:                        # optional: laid over the borrowed uk-prod block
         min: 10
+  stream:
+    handler: stream.handler
+    concurrency:
+      snapStart: false                # opt out of a deploy's snapStart
+      uk-alpha:
+        min: 1
   server:                             # a Lambda Managed Instances function
     handler: server.handler
     concurrency:
@@ -164,9 +171,20 @@ and the second moves traffic, so a rolled-back deploy never leaves the API Gatew
 an alias the rollback deleted. Packaging needs `lambda:GetAlias`. A change to the function's
 `resources.extensions` properties alone (such as `MemorySize`) also publishes a new version.
 
+A deploy entry with `snapStart: true` trades warm pools for
+[SnapStart](https://docs.aws.amazon.com/lambda/latest/dg/snapstart.html), which Lambda cannot
+combine with provisioned concurrency. Every function whose block for that deploy has a floor above
+0, judged before `maxFloor` caps it, gets the framework's `snapStart: true` and no
+`provisionedConcurrency` or `concurrencyAutoscaling`; a function with a floor of 0 stays plain. A
+function opts out with `snapStart: false` outside its blocks and then resolves as usual (borrowed
+block, `maxFloor`, own block). Managed Instances functions are unaffected. In the example above,
+`us-alpha` gives `graphql` SnapStart, while `stream` gets a warm pool of 1.
+
 Packaging fails on a block or target not listed in `deploys`, an unknown setting, a block with a
-ceiling but no floor, `min > max`, or a function that also sets `provisionedConcurrency` or
-`concurrencyAutoscaling` itself.
+ceiling but no floor, `min > max`, a deploy `snapStart` that is not a boolean, a function-level
+`concurrency.snapStart` other than `false`, or a function that also sets `provisionedConcurrency`
+or `concurrencyAutoscaling` itself, or sets `snapStart` itself while its concurrency resolves to
+SnapStart or a warm pool.
 
 ### Defaults
 
