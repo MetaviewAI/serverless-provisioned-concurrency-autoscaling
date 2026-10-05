@@ -214,11 +214,6 @@ function capacityProviderLogicalId(arn: unknown): string | undefined {
   return undefined
 }
 
-// The function-level FunctionScalingConfig governs the frozen $LATEST.PUBLISHED, which keeps
-// serving until the deploy that moves a stage's events onto the alias completes. Once every stage
-// has made that deploy, set this to true to deactivate $LATEST.PUBLISHED and release its capacity.
-const DEACTIVATE_LATEST_PUBLISHED = false
-
 // Functions served by the `live` alias, with the execution environments each version holds.
 export type ManagedInstances = Record<string, number>
 
@@ -404,11 +399,11 @@ export function aliasManagedInstances(
     const properties =
       service.resources.extensions[functionLogicalId].Properties
     properties.PublishToLatestPublished = false
-    if (DEACTIVATE_LATEST_PUBLISHED) {
-      properties.FunctionScalingConfig = {
-        MinExecutionEnvironments: 0,
-        MaxExecutionEnvironments: 0,
-      }
+    // The function-level FunctionScalingConfig governs the frozen $LATEST.PUBLISHED, which serves
+    // nothing once events are on the alias.
+    properties.FunctionScalingConfig = {
+      MinExecutionEnvironments: 0,
+      MaxExecutionEnvironments: 0,
     }
     fn.targetAlias = { name: LIVE_ALIAS, logicalId: aliasLogicalId }
   }

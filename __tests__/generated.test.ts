@@ -389,10 +389,13 @@ describe('aliasManagedInstances', () => {
     aliasManagedInstances(service, managed, naming, routed)
 
     // Then
-    expect(
+    const functionProperties =
       service.resources.extensions.ServerLambdaFunction.Properties
-        .PublishToLatestPublished,
-    ).toBe(false)
+    expect(functionProperties.PublishToLatestPublished).toBe(false)
+    expect(functionProperties.FunctionScalingConfig).toEqual({
+      MinExecutionEnvironments: 0,
+      MaxExecutionEnvironments: 0,
+    })
     const { Resources, Outputs } =
       service.provider.compiledCloudFormationTemplate
     const versionId = service.functions.server.versionLogicalId
@@ -441,9 +444,12 @@ describe('aliasManagedInstances', () => {
       'Fn::GetAtt': [service.functions.server.versionLogicalId, 'Version'],
     })
     expect(service.functions.server.targetAlias).toBeUndefined()
-    expect(
-      service.resources.extensions.ServerLambdaFunction.Properties,
-    ).not.toHaveProperty('PublishToLatestPublished')
+    const functionProperties =
+      service.resources.extensions.ServerLambdaFunction.Properties
+    expect(functionProperties).not.toHaveProperty('PublishToLatestPublished')
+    expect(functionProperties.FunctionScalingConfig).toEqual({
+      MinExecutionEnvironments: 3,
+    })
   })
 
   it('names the version the same before and after events move onto the alias', () => {
